@@ -822,7 +822,7 @@ pub fn parse_osm_data(
             let origin_lat = (bbox.min().lat() + bbox.max().lat()) / 2.0;
             let origin_lon = (bbox.min().lng() + bbox.max().lng()) / 2.0;
             let proj = crate::projection::WebMercatorProjection::new(origin_lat, origin_lon, scale);
-            CoordTransformer::with_projection(&bbox, scale, &proj)
+            CoordTransformer::with_projection(&bbox, scale, Box::new(proj))
         }
         crate::projection::ProjectionKind::Local => {
             CoordTransformer::llbbox_to_xzbbox(&bbox, scale)

@@ -227,7 +227,7 @@ fn world_anchor(lat: f64, lon: f64, llbbox: LLBBox, args: &Args) -> Option<(i32,
             let origin_lon = (llbbox.min().lng() + llbbox.max().lng()) / 2.0;
             let proj =
                 crate::projection::WebMercatorProjection::new(origin_lat, origin_lon, args.scale);
-            CoordTransformer::with_projection(&llbbox, args.scale, &proj)
+            CoordTransformer::with_projection(&llbbox, args.scale, Box::new(proj))
         }
         crate::projection::ProjectionKind::Local => {
             CoordTransformer::llbbox_to_xzbbox(&llbbox, args.scale)

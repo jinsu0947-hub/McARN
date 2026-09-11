@@ -566,7 +566,7 @@ fn run_cli() {
                         (effective_bbox.min().lng() + effective_bbox.max().lng()) / 2.0;
                     let proj =
                         projection::WebMercatorProjection::new(origin_lat, origin_lon, args.scale);
-                    CoordTransformer::with_projection(&effective_bbox, args.scale, &proj)
+                    CoordTransformer::with_projection(&effective_bbox, args.scale, Box::new(proj))
                 }
                 projection::ProjectionKind::Local => {
                     CoordTransformer::llbbox_to_xzbbox(&effective_bbox, args.scale)
