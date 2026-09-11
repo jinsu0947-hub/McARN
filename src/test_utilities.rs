@@ -18,6 +18,7 @@ pub fn generate_example(llbbox: LLBBox) -> (XZBBox, Vec<ProcessedElement>) {
             1.0,
             false,
             crate::projection::ProjectionKind::Local,
+            None,
         );
     parsed_elements
         .sort_by_key(|element: &osm_parser::ProcessedElement| osm_parser::get_priority(element));

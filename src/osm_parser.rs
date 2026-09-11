@@ -1,7 +1,6 @@
 use crate::clipping::clip_way_to_bbox;
 use crate::coordinate_system::cartesian::{XZBBox, XZPoint};
 use crate::coordinate_system::geographic::{LLBBox, LLPoint};
-use crate::coordinate_system::transformation::CoordTransformer;
 use crate::progress::emit_gui_progress_update;
 use colored::Colorize;
 use serde::Deserialize;
@@ -805,6 +804,7 @@ pub fn parse_osm_data(
     scale: f64,
     debug: bool,
     projection: crate::projection::ProjectionKind,
+    korea_planar_bbox: Option<crate::projection::KoreaPlanarBBox>,
 ) -> (
     Vec<ProcessedElement>,
     XZBBox,
@@ -817,22 +817,13 @@ pub fn parse_osm_data(
     // Deserialize the JSON data into the OSMData structure
     let data = SplitOsmData::from_raw_osm_data(osm_data);
 
-    let (coord_transformer, xzbbox) = match projection {
-        crate::projection::ProjectionKind::WebMercator => {
-            let origin_lat = (bbox.min().lat() + bbox.max().lat()) / 2.0;
-            let origin_lon = (bbox.min().lng() + bbox.max().lng()) / 2.0;
-            let proj = crate::projection::WebMercatorProjection::new(origin_lat, origin_lon, scale);
-            CoordTransformer::with_projection(&bbox, scale, Box::new(proj))
-        }
-        crate::projection::ProjectionKind::Local => {
-            CoordTransformer::llbbox_to_xzbbox(&bbox, scale)
-        }
-    }
     // Panics rather than exits: the GUI calls this from a Tauri blocking task, where an
     // exit would take the whole app down. Bad scales are rejected up front by validate_scale.
-    .unwrap_or_else(|e| {
-        panic!("Error in defining coordinate transformation:\n{e}");
-    });
+    let (coord_transformer, xzbbox) =
+        crate::projection::build_transformer(&bbox, projection, scale, korea_planar_bbox)
+            .unwrap_or_else(|e| {
+                panic!("Error in defining coordinate transformation:\n{e}");
+            });
 
     if debug {
         println!("Total elements: {}", data.total_count());

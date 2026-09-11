@@ -116,6 +116,56 @@ impl CoordTransformer {
         ))
     }
 
+    /// Create a `CoordTransformer` when the output block extents are already
+    /// known exactly, instead of deriving them by projecting a geographic
+    /// bbox's four corners. `width_blocks`/`height_blocks` must already be
+    /// scaled (SPEC_Ingest.md's `SCALE`) -- this constructor does no scale
+    /// arithmetic of its own, only shape.
+    ///
+    /// Use this for a projection whose "area to generate" is natively
+    /// defined in the projection's own planar space (SPEC_Ingest.md's Korea
+    /// TM path via `KoreaPlanarBBox`): projecting a lat/lon rectangle's four
+    /// corners independently (`with_projection`, above) can yield a sheared
+    /// quadrilateral whose envelope is wider than intended, away from a
+    /// projection's central meridian (meridian convergence). Building the
+    /// block `(0,0)` origin so it coincides with the projection's own
+    /// `forward()` origin, and taking the extents directly, sidesteps that:
+    /// there is only one rectangle in play, not four independently-projected
+    /// corners to reconcile.
+    pub fn from_planar_extents(
+        projection: Box<dyn Projection>,
+        width_blocks: i32,
+        height_blocks: i32,
+    ) -> Result<(CoordTransformer, XZBBox), String> {
+        if width_blocks <= 0 || height_blocks <= 0 {
+            return Err(format!(
+                "Planar extents must be positive: width={width_blocks}, height={height_blocks}"
+            ));
+        }
+
+        // The projection's own forward() origin (its E0/N0) is block (0,0);
+        // north is -Z (SPEC_Ingest.md §2.2), so the rectangle extends from
+        // (0, -height) to (width, 0).
+        let xzbbox = XZBBox::rect_from_min_max(0, -height_blocks, width_blocks, 0)
+            .map_err(|e| format!("Failed to create XZBBox from planar extents: {}", e))?;
+
+        Ok((
+            CoordTransformer {
+                // Unused in `ProjectionMode::Projected` (see transform_point) --
+                // there is no lat/lon rectangle here to compute a relative
+                // position within.
+                len_lat: 0.0,
+                len_lng: 0.0,
+                scale_factor_x: width_blocks as f64,
+                scale_factor_z: height_blocks as f64,
+                min_lat: 0.0,
+                min_lng: 0.0,
+                mode: ProjectionMode::Projected(projection),
+            },
+            xzbbox,
+        ))
+    }
+
     pub fn transform_point(&self, llpoint: LLPoint) -> XZPoint {
         match &self.mode {
             ProjectionMode::Local => {
@@ -392,6 +442,163 @@ mod test {
             ps.z,
             pn.z,
         );
+    }
+
+    // ----- Korea TM (EPSG:5186) projection mode tests -----
+    //
+    // A precise 1500m x 1500m square (SPEC_GenerationScope P0's "영선동 일대
+    // 1.5km 사각형") centred on Yeongseon-dong, Busan (35.0835693N 129.0414405E,
+    // OSM Nominatim). Built by projecting the center to EPSG:5186 (E,N),
+    // offsetting +-750m in that metric space, and projecting back -- not a
+    // naive +-0.0075 degree box, which isn't square in real metres this far
+    // from the equator. Corners cross-checked against `proj4` (npm, same
+    // EPSG:5186 proj-string as korea_tm.rs's own reference values):
+    //   sw E,N = 385433.176, 277523.071 -> lat,lon 35.07695141877934, 129.03305391424703
+    //   ne E,N = 386933.176, 279023.071 -> lat,lon 35.090186547431124, 129.04982843930924
+    fn yeongseon_1_5km_square_llbbox() -> LLBBox {
+        LLBBox::new(
+            35.07695141877934,
+            129.03305391424703,
+            35.090186547431124,
+            129.04982843930924,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_korea_tm_sw_corner_maps_near_origin() {
+        let llbbox = yeongseon_1_5km_square_llbbox();
+        let proj =
+            crate::projection::KoreaTmProjection::new(llbbox.min().lat(), llbbox.min().lng(), 1.75);
+        let (transformer, _) =
+            CoordTransformer::with_projection(&llbbox, 1.75, Box::new(proj)).unwrap();
+
+        let sw = LLPoint::new(llbbox.min().lat(), llbbox.min().lng()).unwrap();
+        let pt = transformer.transform_point(sw);
+        assert_eq!(pt.x, 0, "SW corner should map to x=0, got {}", pt.x);
+        assert_eq!(pt.z, 0, "SW corner should map to z=0, got {}", pt.z);
+    }
+
+    #[test]
+    fn test_korea_tm_east_increases_x_north_decreases_z() {
+        let llbbox = yeongseon_1_5km_square_llbbox();
+        let proj =
+            crate::projection::KoreaTmProjection::new(llbbox.min().lat(), llbbox.min().lng(), 1.75);
+        let (transformer, _) =
+            CoordTransformer::with_projection(&llbbox, 1.75, Box::new(proj)).unwrap();
+
+        let sw = LLPoint::new(llbbox.min().lat(), llbbox.min().lng()).unwrap();
+        let ne = LLPoint::new(llbbox.max().lat(), llbbox.max().lng()).unwrap();
+        let p_sw = transformer.transform_point(sw);
+        let p_ne = transformer.transform_point(ne);
+
+        assert!(p_ne.x > p_sw.x, "east should increase x");
+        assert!(p_ne.z < p_sw.z, "north should decrease z");
+    }
+
+    #[test]
+    fn test_korea_tm_with_projection_envelope_is_wider_than_nominal() {
+        // `with_projection` (the generic, four-corner-envelope path) gives
+        // NOT 2625 (1500m * 1.75), even though the bbox is exactly 1500m
+        // SW-to-NE by construction (see the fixture above). Yeongseon-dong
+        // sits ~2 degrees east of EPSG:5186's central meridian (127E) -- far
+        // enough for grid convergence to matter. A lat/lon rectangle is not a
+        // square in E/N space that far from the central meridian: its NW/SE
+        // corners land outside the SW-NE diagonal's own bounding box (project
+        // them and see -- NW.x comes out negative, SE.x comes out past NE.x),
+        // so the envelope is measurably wider than the nominal 1500m. This is
+        // correct TM behaviour for this constructor, not a bug -- see
+        // `test_korea_tm_from_planar_extents_gives_the_exact_square` below
+        // for the constructor that does NOT have this widening, which is
+        // what `--input-source kr` actually uses now.
+        //
+        // Expected values cross-checked independently via `proj4` (npm),
+        // projecting all four corners with the exact same E0/N0-shift-then-
+        // scale steps `with_projection`/`KoreaTmProjection::forward` use:
+        //   nw=(-52.4,-2570.1) se=(2677.9,-54.9) ne=(2625.0,-2625.0) sw=(0,0)
+        //   -> x in [-53, 2678] (2731 wide), z in [-2626, 0] (2626 wide)
+        let llbbox = yeongseon_1_5km_square_llbbox();
+        let proj =
+            crate::projection::KoreaTmProjection::new(llbbox.min().lat(), llbbox.min().lng(), 1.75);
+        let (transformer, xzbbox) =
+            CoordTransformer::with_projection(&llbbox, 1.75, Box::new(proj)).unwrap();
+
+        assert!(
+            (transformer.scale_factor_x() - 2731.0).abs() < 2.0,
+            "unexpected x extent in blocks: {}",
+            transformer.scale_factor_x()
+        );
+        assert!(
+            (transformer.scale_factor_z() - 2626.0).abs() < 2.0,
+            "unexpected z extent in blocks: {}",
+            transformer.scale_factor_z()
+        );
+        assert!(xzbbox.max_x() - xzbbox.min_x() > 2000);
+    }
+
+    #[test]
+    fn test_korea_tm_from_planar_extents_does_not_further_distort_the_llbbox_envelope() {
+        // `from_llbbox`'s envelope is genuinely ~1560m x 1500m, not 1500x1500
+        // (see KoreaPlanarBBox's own width/height tests) -- a lat/lon
+        // rectangle really does cover a non-square area in E/N this far from
+        // the central meridian, and that is not something to "fix away" when
+        // converting FROM lat/lon; it is what that lat/lon rectangle covers.
+        // What `from_planar_extents` fixes is that this rectangle, once
+        // known, is reproduced exactly -- not widened AGAIN the way
+        // `with_projection`'s independent 4-corner re-projection would.
+        let llbbox = yeongseon_1_5km_square_llbbox();
+        let planar = crate::projection::korea_tm::KoreaPlanarBBox::from_llbbox(&llbbox);
+        let proj = crate::projection::KoreaTmProjection::with_origin_en(
+            planar.e_min(),
+            planar.n_min(),
+            1.75,
+        );
+        let width_blocks = (planar.width_m() * 1.75).round() as i32;
+        let height_blocks = (planar.height_m() * 1.75).round() as i32;
+        let (transformer, xzbbox) =
+            CoordTransformer::from_planar_extents(Box::new(proj), width_blocks, height_blocks)
+                .unwrap();
+
+        assert_eq!(transformer.scale_factor_x() as i32, width_blocks);
+        assert_eq!(transformer.scale_factor_z() as i32, height_blocks);
+        assert_eq!(xzbbox.min_x(), 0);
+        assert_eq!(xzbbox.min_z(), -height_blocks);
+        assert_eq!(xzbbox.max_x(), width_blocks);
+        assert_eq!(xzbbox.max_z(), 0);
+        assert!((width_blocks - 2731).abs() <= 1, "width_blocks={width_blocks}");
+        assert!((height_blocks - 2625).abs() <= 1, "height_blocks={height_blocks}");
+    }
+
+    #[test]
+    fn test_korea_tm_from_planar_extents_with_direct_en_gives_a_true_square() {
+        // The actual fix for "I want an exact 1500m square": specify E/N
+        // directly (KoreaPlanarBBox::new, what `--bbox-en` parses to) instead
+        // of deriving it from a lat/lon rectangle at all. No lat/lon
+        // rectangle is ever built or projected, so there is no shear to
+        // widen anything -- width and height in blocks come out identically
+        // (up to the same rounding on each side), unlike the llbbox-derived
+        // case above.
+        let planar = crate::projection::korea_tm::KoreaPlanarBBox::new(
+            385_433.1762, 277_523.0711, 386_933.1762, 279_023.0711,
+        )
+        .unwrap();
+        assert!((planar.width_m() - 1500.0).abs() < 1.0e-3);
+        assert!((planar.height_m() - 1500.0).abs() < 1.0e-3);
+
+        let proj = crate::projection::KoreaTmProjection::with_origin_en(
+            planar.e_min(),
+            planar.n_min(),
+            1.75,
+        );
+        let width_blocks = (planar.width_m() * 1.75).round() as i32;
+        let height_blocks = (planar.height_m() * 1.75).round() as i32;
+        let (_, xzbbox) =
+            CoordTransformer::from_planar_extents(Box::new(proj), width_blocks, height_blocks)
+                .unwrap();
+
+        assert_eq!(width_blocks, 2625);
+        assert_eq!(height_blocks, 2625);
+        assert_eq!(xzbbox.max_x() - xzbbox.min_x(), xzbbox.max_z() - xzbbox.min_z());
     }
 
     #[test]

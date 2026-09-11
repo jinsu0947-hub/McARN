@@ -1628,6 +1628,12 @@ fn gui_start_generation(
                 downloader: "requests".to_string(),
                 scale: world_scale,
                 projection: crate::projection::ProjectionKind::Local,
+                // The GUI has no Korean-source picker yet -- SPEC_Ingest.md §7
+                // notes the GUI needs its own scope-selection change, which is
+                // separate from SPEC_Build.md M0's CLI-only structure.
+                input_source: crate::args::InputSource::Osm,
+                bbox_en: None,
+                korea_planar_bbox: None,
                 ground_level,
                 mode: if skip_osm_objects {
                     crate::args::GenerationMode::TerrainOnly
@@ -1810,6 +1816,7 @@ fn gui_start_generation(
                             args.scale,
                             args.debug,
                             crate::projection::ProjectionKind::Local,
+                            None,
                         );
 
                     let overture::OvertureData {

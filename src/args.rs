@@ -49,9 +49,46 @@ pub struct Args {
     pub body: crate::celestial::CelestialBody,
 
     /// Projection mode for coordinate mapping.
-    /// local: each generation starts at Minecraft (0,0). The only supported mode.
+    /// local: each generation starts at Minecraft (0,0). korea_tm is set
+    /// automatically by --input-source kr; picking it directly is unusual.
     #[arg(long, default_value = "local")]
     pub projection: crate::projection::ProjectionKind,
+
+    /// Where map data comes from (SPEC_Ingest.md §1: "입력 소스를 실행 옵션으로
+    /// 고르는 구조로 둔다"). `osm` is the existing OpenStreetMap/Overture path,
+    /// unchanged. `kr` switches to Korean public data (SPEC_Ingest.md §2-§5) --
+    /// for now this only wires up the §2 coordinate transform (EPSG:5186,
+    /// scale 1.75) and forces `--mode terrain-only`, since the road
+    /// (표준노드링크) and building (건물통합정보) ingestion this source implies
+    /// are SPEC_Build.md M1/M4 work, not yet implemented. Elevation is
+    /// unaffected either way: both sources use Arnis's existing elevation
+    /// providers (SPEC_Ingest.md §5.1).
+    #[arg(long = "input-source", value_enum, default_value_t = InputSource::Osm)]
+    pub input_source: InputSource,
+
+    /// The generation extent as EPSG:5186 easting/northing metres directly
+    /// ("e_min,n_min,e_max,n_max"), for `--input-source kr`. A lat/lon
+    /// `--bbox` is not a rectangle in E/N space away from EPSG:5186's central
+    /// meridian (127E) -- meridian convergence shears it -- so converting
+    /// one always produces a rectangle at least as large as, and generally
+    /// not equal to, whatever exact area was intended. `--bbox-en` skips
+    /// that conversion entirely: the value given here is the exact output
+    /// rectangle, with no lat/lon step in between. `--bbox` is still
+    /// required alongside it (data fetching -- OSM/Overture/elevation --
+    /// only knows how to ask for a lat/lon region); `--bbox-en` overrides
+    /// only the output shape, not what gets fetched.
+    #[arg(long = "bbox-en", allow_hyphen_values = true, value_parser = crate::projection::KoreaPlanarBBox::from_str)]
+    pub bbox_en: Option<crate::projection::KoreaPlanarBBox>,
+
+    /// Resolved once, by `apply_input_source_defaults`, from `--bbox-en` or
+    /// by converting `--bbox` -- SPEC_Ingest.md §2.1's "read once and
+    /// convert" applied to extent, not just per-point CRS lookup: every call
+    /// site that needs the Korea TM output rectangle reads this same
+    /// already-resolved value instead of each re-deriving its own envelope
+    /// from `bbox`. Not a CLI flag itself (`--bbox-en` is); `#[arg(skip)]`
+    /// keeps clap from trying to parse it.
+    #[arg(skip)]
+    pub korea_planar_bbox: Option<crate::projection::KoreaPlanarBBox>,
 
     /// Ground level to use in the Minecraft world
     #[arg(long, default_value_t = -62, allow_hyphen_values = true)]
@@ -375,6 +412,19 @@ impl GenerationMode {
     }
 }
 
+/// Where map data comes from -- SPEC_Ingest.md §1's "입력 소스를 실행 옵션으로
+/// 고르는 구조". See the field doc on `Args::input_source` for what each value
+/// currently does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
+pub enum InputSource {
+    /// OpenStreetMap + Overture Maps (existing path, unchanged).
+    #[default]
+    Osm,
+    /// Korean public data (SPEC_Ingest.md §2-§5). M0: coordinate transform and
+    /// terrain only -- see `apply_input_source_defaults`.
+    Kr,
+}
+
 /// Below this scale, OSM objects stop being representable: road half-widths floor at 1
 /// (so every road is >= 3 blocks = 10 m across at 0.3), buildings collapse into 1x1x3
 /// pillars, and fixed-size props come to dominate the scene. Objects are skipped instead.
@@ -569,6 +619,47 @@ pub fn apply_body_defaults(args: &mut Args) {
     }
 }
 
+/// SPEC_Ingest.md §2/§5, SPEC_Build.md M0: `--input-source kr` selects the
+/// Korea Central Belt (EPSG:5186) coordinate transform and, since the Korean
+/// road/building ingestion it implies isn't built yet (M1/M4), forces
+/// terrain-only generation -- the same "source picks mode" precedent
+/// `apply_body_defaults` already sets for Moon/Mars. Shared by the CLI and the
+/// GUI for the same reason that one is.
+pub fn apply_input_source_defaults(args: &mut Args) {
+    if args.input_source != InputSource::Kr {
+        return;
+    }
+    // SPEC_Ingest.md §2 fixes this as a pipeline constant ("축척 등방 1.75"),
+    // not a per-run tunable -- the same reasoning `apply_body_defaults`
+    // already applies to Moon/Mars's fixed scale.
+    if args.scale != 1.75 {
+        args.scale = 1.75;
+    }
+    if args.projection != crate::projection::ProjectionKind::KoreaTm {
+        args.projection = crate::projection::ProjectionKind::KoreaTm;
+    }
+    if args.mode != GenerationMode::TerrainOnly {
+        eprintln!(
+            "Note: --input-source kr only has terrain implemented so far (SPEC_Build.md M0); \
+             forcing --mode terrain-only. Road and building ingestion are M1/M4."
+        );
+        args.mode = GenerationMode::TerrainOnly;
+    }
+    // SPEC_Ingest.md §2.1: convert lat/lon to the planar CRS once, here, at
+    // the entry point -- not by having every one of build_transformer's four
+    // call sites independently re-derive the same envelope from `args.bbox`.
+    // `--bbox-en` (already in the target space) is used as-is; otherwise the
+    // one-time envelope conversion runs against `--bbox`. Left `None` if
+    // neither is present -- validate_args reports that as a proper error
+    // rather than this function guessing or panicking on a bbox that might
+    // not exist yet (validation hasn't run when this is called).
+    args.korea_planar_bbox = match (&args.bbox_en, &args.bbox) {
+        (Some(en), _) => Some(*en),
+        (None, Some(llbbox)) => Some(crate::projection::KoreaPlanarBBox::from_llbbox(llbbox)),
+        (None, None) => None,
+    };
+}
+
 /// Clap's `--world-time` default, so `apply_body_defaults` can tell left-alone
 /// from explicitly-set.
 pub const DEFAULT_WORLD_TIME: i64 = 6_000;
@@ -604,6 +695,34 @@ pub fn validate_args(args: &Args) -> Result<(), String> {
     if args.projection == crate::projection::ProjectionKind::WebMercator {
         return Err(
             "--projection web_mercator was experimental and never worked: it stretches the world north-south by 1/cos(latitude) (about 1.5x at 47 degrees), so objects come out elongated and misaligned with the terrain. Use --projection local."
+                .to_string(),
+        );
+    }
+
+    // korea_tm's E0/N0 origin is meaningless without --input-source kr choosing
+    // it (apply_input_source_defaults sets it automatically); passed on its own
+    // it is almost certainly a mistake rather than an intentional combination.
+    if args.projection == crate::projection::ProjectionKind::KoreaTm
+        && args.input_source != InputSource::Kr
+    {
+        return Err(
+            "--projection korea_tm needs --input-source kr, which selects it automatically. \
+             Pass --input-source kr instead of --projection korea_tm directly."
+                .to_string(),
+        );
+    }
+
+    // --bbox-en's own doc comment: it overrides only the output shape, not what
+    // gets fetched, so it is never a substitute for --bbox. --input-source kr
+    // always forces --mode terrain-only (apply_input_source_defaults), and the
+    // generic bbox check below already rejects terrain-only without --bbox --
+    // this only guards the case that check can't see: --bbox-en given without
+    // --bbox, which would otherwise reach build_transformer with a resolved
+    // korea_planar_bbox but no lat/lon region to fetch elevation for.
+    if args.input_source == InputSource::Kr && args.bbox_en.is_some() && args.bbox.is_none() {
+        return Err(
+            "--bbox-en overrides the output shape only; --input-source kr still needs --bbox \
+             (lat/lon) to know what region to fetch."
                 .to_string(),
         );
     }

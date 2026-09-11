@@ -650,6 +650,14 @@ impl Ground {
         (raw as f64 * correction).round() as i32
     }
 
+    /// Minimum source elevation in the target area, in real-world metres --
+    /// SPEC_Ingest.md §2.2's `H0` ("대상 영역 최저 표고"), for `manifest.json`'s
+    /// `origin.h0`. `None` without elevation data (flat ground has no real
+    /// minimum to report).
+    pub fn min_elevation_m(&self) -> Option<f64> {
+        self.elevation_data.as_ref().map(|d| d.min_height_m)
+    }
+
     /// Vertical blocks per real-world metre, 1.0 without elevation (or with zero
     /// relief), so callers inverting the metre->Y affine can divide unconditionally.
     #[inline(always)]

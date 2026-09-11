@@ -14,7 +14,6 @@ use crate::block_definitions::{
 };
 use crate::coordinate_system::cartesian::XZBBox;
 use crate::coordinate_system::geographic::{LLBBox, LLPoint};
-use crate::coordinate_system::transformation::CoordTransformer;
 use crate::osm_parser::ProcessedElement;
 use crate::structures::schematic::{load_palettized, rotate_props};
 use crate::world_editor::WorldEditor;
@@ -221,18 +220,12 @@ pub fn prescan(
 /// Project an anchor into world XZ the way the parser projects node coords.
 fn world_anchor(lat: f64, lon: f64, llbbox: LLBBox, args: &Args) -> Option<(i32, i32)> {
     let llpoint = LLPoint::new(lat, lon).ok()?;
-    let (transformer, pre_rotation_bbox) = match args.projection {
-        crate::projection::ProjectionKind::WebMercator => {
-            let origin_lat = (llbbox.min().lat() + llbbox.max().lat()) / 2.0;
-            let origin_lon = (llbbox.min().lng() + llbbox.max().lng()) / 2.0;
-            let proj =
-                crate::projection::WebMercatorProjection::new(origin_lat, origin_lon, args.scale);
-            CoordTransformer::with_projection(&llbbox, args.scale, Box::new(proj))
-        }
-        crate::projection::ProjectionKind::Local => {
-            CoordTransformer::llbbox_to_xzbbox(&llbbox, args.scale)
-        }
-    }
+    let (transformer, pre_rotation_bbox) = crate::projection::build_transformer(
+        &llbbox,
+        args.projection,
+        args.scale,
+        args.korea_planar_bbox,
+    )
     .ok()?;
 
     let xzpoint = transformer.transform_point(llpoint);

@@ -27,6 +27,7 @@ mod ground_generation;
 mod land_cover;
 mod landmarks;
 mod luanti_block_map;
+mod manifest;
 mod map_item;
 mod map_item_palette;
 mod map_preview;
@@ -177,6 +178,7 @@ fn run_cli() {
     // Parse input arguments
     let mut args: Args = Args::parse();
     args::apply_body_defaults(&mut args);
+    args::apply_input_source_defaults(&mut args);
     let args = args;
 
     // Validate arguments (path requirements differ between Java and Bedrock)
@@ -464,6 +466,7 @@ fn run_cli() {
             args.scale,
             args.debug,
             args.projection,
+            args.korea_planar_bbox,
         );
     bench.mark("parse_osm");
 
@@ -551,27 +554,18 @@ fn run_cli() {
     let spawn_point: Option<(i32, i32)> = match (args.spawn_lat, args.spawn_lng) {
         (Some(lat), Some(lng)) => {
             use coordinate_system::geographic::LLPoint;
-            use coordinate_system::transformation::CoordTransformer;
 
             let llpoint = LLPoint::new(lat, lng).unwrap_or_else(|e| {
                 eprintln!("{} Invalid spawn coordinates: {}", "Error:".red().bold(), e);
                 std::process::exit(1);
             });
 
-            let (transformer, pre_rot_bbox) = match args.projection {
-                projection::ProjectionKind::WebMercator => {
-                    let origin_lat =
-                        (effective_bbox.min().lat() + effective_bbox.max().lat()) / 2.0;
-                    let origin_lon =
-                        (effective_bbox.min().lng() + effective_bbox.max().lng()) / 2.0;
-                    let proj =
-                        projection::WebMercatorProjection::new(origin_lat, origin_lon, args.scale);
-                    CoordTransformer::with_projection(&effective_bbox, args.scale, Box::new(proj))
-                }
-                projection::ProjectionKind::Local => {
-                    CoordTransformer::llbbox_to_xzbbox(&effective_bbox, args.scale)
-                }
-            }
+            let (transformer, pre_rot_bbox) = projection::build_transformer(
+                &effective_bbox,
+                args.projection,
+                args.scale,
+                args.korea_planar_bbox,
+            )
             .unwrap_or_else(|e| {
                 eprintln!(
                     "{} Failed to convert spawn point: {}",
@@ -639,6 +633,36 @@ fn run_cli() {
         }
     }
 
+    // SPEC_Build.md §3.1: manifest.json needs the pre-generation elevation
+    // minimum and the exact block bbox -- `ground` and `xzbbox` are moved into
+    // `generate_world_with_options` below, so both must be captured now.
+    let korea_manifest = (args.input_source == args::InputSource::Kr).then(|| {
+        let planar = args
+            .korea_planar_bbox
+            .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
+        manifest::Manifest {
+            scale: args.scale,
+            origin: manifest::ManifestOrigin {
+                epsg: 5186,
+                e0: planar.e_min(),
+                n0: planar.n_min(),
+                h0: ground.min_elevation_m(),
+                y2_base: -88,
+            },
+            bbox: [
+                xzbbox.min_x(),
+                xzbbox.min_z(),
+                xzbbox.max_x(),
+                xzbbox.max_z(),
+            ],
+            sources: if ground.elevation_enabled {
+                vec![manifest::elevation_source_entry()]
+            } else {
+                vec![]
+            },
+        }
+    });
+
     let generation_options = data_processing::GenerationOptions {
         path: generation_path.clone(),
         format: world_format,
@@ -661,6 +685,20 @@ fn run_cli() {
         part_groups,
     ) {
         Ok(_) => {
+            if let Some(m) = korea_manifest {
+                // SPEC_Build.md §3: written beside the world folder, not inside
+                // it, so it survives whatever a world browser does to the
+                // folder's own contents.
+                let manifest_dir = generation_path.parent().unwrap_or(&generation_path);
+                if let Err(e) = m.write(manifest_dir) {
+                    eprintln!(
+                        "{} Failed to write manifest.json: {}",
+                        "Warning:".yellow().bold(),
+                        e
+                    );
+                }
+            }
+
             if args.bedrock {
                 println!(
                     "{} Bedrock world saved to: {}",
