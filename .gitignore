@@ -82,3 +82,9 @@ gen/
 
 # Working notes for coding agents, not part of the project.
 /CLAUDE.md
+
+# Source data for --input-source kr (표준노드링크, 버스 정류소/노선
+# SHP+CSV from Korean public data portals) plus review artifacts this
+# repo's own tooling writes into it (stops_review.json, ...) -- ~800 MB,
+# never meant to be committed.
+/data/
