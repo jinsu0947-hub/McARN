@@ -65,10 +65,14 @@
 //!   scope, not an oversight.
 //! - `oneway` (SPEC_Build §3.2) has no confirmed source field in the actual
 //!   `.dbf` (see `shapefile.rs`'s field dump) and is always recorded `false`.
-//! - `is_bridge` (SPEC_Build §3.2) is approximated as `ROAD_TYPE != "000"`
-//!   (the sampled records' apparent "normal road" code) -- not a confirmed
-//!   code table, so treat this field as low-confidence.
+//! - `is_bridge` (SPEC_Build §3.2) is now confirmed, not estimated: `true`
+//!   only for `bridges::MANUAL_BRIDGES`'s own hand-built deck segments,
+//!   `false` for every 표준노드링크-derived segment -- including any that
+//!   physically crosses a bridge this session couldn't manually confirm
+//!   (남항대교/부산항대교, and 부산대교's own exact link chain; see
+//!   `bridges`' module doc for what was and wasn't confirmed and why).
 
+pub mod bridges;
 pub mod routing;
 pub mod shapefile;
 
@@ -268,6 +272,14 @@ pub struct Segment {
     f_node: String,
     t_node: String,
     points: Vec<ProfilePoint>,
+    /// SPEC_Bridge.md: confirmed, not estimated -- true only for the
+    /// hand-built deck segments `bridges::MANUAL_BRIDGES` adds. Every
+    /// 표준노드링크-derived segment is `false`, including any that
+    /// physically crosses a bridge this session couldn't confirm (see
+    /// `bridges`' module doc's disclosed gaps) -- reporting "confirmed
+    /// false" there would be as wrong as the old heuristic's guesses, so
+    /// those crossings simply aren't flagged yet rather than guessed at.
+    is_bridge: bool,
 }
 
 impl Segment {
@@ -798,6 +810,17 @@ pub fn compute_kr_road_network(
         println!("KR roads: named streets in this clip: {}", distinct_names.join(", "));
     }
 
+    // SPEC_Bridge.md §0: bridges are excluded from the normal ground-
+    // following pass and built separately (`bridges::MANUAL_BRIDGES`) --
+    // otherwise the real link's terrain-following profile and the bridge's
+    // floating deck would both get drawn across the same water crossing.
+    // Only `YEONGDO_BRIDGE` has confirmed real LINK_IDs to exclude here
+    // (see that module's doc for why 부산대교 and the two harbor bridges
+    // don't); this filter is a no-op for the rest until that's known.
+    let excluded_link_ids: std::collections::HashSet<&str> =
+        bridges::MANUAL_BRIDGES.iter().flat_map(|b| b.excluded_link_ids.iter().copied()).collect();
+    let links: Vec<RawLink> = links.into_iter().filter(|l| !excluded_link_ids.contains(l.link_id.as_str())).collect();
+
     let mut node_pos: HashMap<String, (i32, i32)> = HashMap::new();
     for n in &nodes {
         let (bx, bz) = en_to_block(n.e, n.n, planar, scale);
@@ -865,6 +888,73 @@ pub fn compute_kr_road_network(
             f_node: l.f_node.clone(),
             t_node: l.t_node.clone(),
             points,
+            is_bridge: false,
+        });
+    }
+
+    // SPEC_Bridge.md §6.1/§7: manually specified deck segments (see
+    // `bridges`' module doc for how -- no confirmed bridge field exists in
+    // 표준노드링크). Endpoint height comes from the *already-solved* real
+    // node network when the bridge names a confirmed node ID there (so the
+    // deck matches the abutment exactly, per §7 "교대 위치를 노드로 고정"),
+    // or from a direct `Ground` sample otherwise. Either way, the profile
+    // between the two ends is a plain linear interpolation, not
+    // `profile_segment`'s ground-following smoothing -- §7's "다리 쪽은
+    // 지형 추종을 끄고 매끄러움만 유지" applied literally.
+    for (bi, bridge) in bridges::MANUAL_BRIDGES.iter().enumerate() {
+        let block_points = resample_to_blocks(
+            &bridge.waypoints_en.iter().map(|&(e, n)| en_to_block(e, n, planar, scale)).collect::<Vec<_>>(),
+        );
+        if block_points.len() < 2 {
+            continue;
+        }
+        let end_y2 = |end: usize| -> f64 {
+            if let Some(node_id) = bridge.end_node_ids[end] {
+                if let Some(&y2) = node_y2.get(node_id) {
+                    return y2 as f64;
+                }
+            }
+            let (x, z) = if end == 0 { block_points[0] } else { block_points[block_points.len() - 1] };
+            (ground_y_at(ground, xzbbox, x.round() as i32, z.round() as i32) * 2) as f64
+        };
+        let start_y2 = end_y2(0);
+        let finish_y2 = end_y2(1);
+
+        let cumulative: Vec<f64> = {
+            let mut acc = vec![0.0];
+            for w in block_points.windows(2) {
+                let d = ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt();
+                acc.push(acc.last().unwrap() + d);
+            }
+            acc
+        };
+        let total_dist = *cumulative.last().unwrap();
+        let points: Vec<ProfilePoint> = block_points
+            .iter()
+            .zip(cumulative.iter())
+            .map(|(&(x, z), &d)| {
+                let t = if total_dist > 1e-6 { d / total_dist } else { 0.0 };
+                let y2 = (start_y2 + (finish_y2 - start_y2) * t).round() as i32;
+                ProfilePoint { x: x.round() as i32, z: z.round() as i32, y2 }
+            })
+            .collect();
+
+        let lanes = match bridge.class {
+            RoadClass::A | RoadClass::B => 6,
+            RoadClass::C => 4,
+            RoadClass::D | RoadClass::E => 2,
+            RoadClass::F => 1,
+        };
+        segments.push(Segment {
+            id: format!("bridge{bi:02}"),
+            link_id: format!("manual-bridge-{}", bridge.name),
+            lanes,
+            class: bridge.class,
+            road_type: "bridge".to_string(),
+            f_node: bridge.end_node_ids[0].map(str::to_string).unwrap_or_else(|| format!("bridge{bi:02}-a")),
+            t_node: bridge.end_node_ids[1].map(str::to_string).unwrap_or_else(|| format!("bridge{bi:02}-b")),
+            points,
+            is_bridge: true,
         });
     }
 
@@ -974,7 +1064,7 @@ pub fn write_roadgraph_json(
                 lanes: s.lanes,
                 road_class: s.class.as_str(),
                 oneway: false, // see module doc: no confirmed source field
-                is_bridge: !s.road_type.is_empty() && s.road_type != "000", // see module doc: unconfirmed heuristic
+                is_bridge: s.is_bridge, // confirmed, not estimated -- see `Segment::is_bridge`'s own doc
                 ends: [s.f_node.clone(), s.t_node.clone()],
                 length: s.points.len(),
                 points: s

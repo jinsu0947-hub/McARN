@@ -675,4 +675,28 @@ mod tests {
             println!("[UNPLACED] seq {} \"{}\" ({}) -- {:?}", u.seq, u.stop_name, u.stop_code, u.reason);
         }
     }
+
+    /// One-off: precise EN (EPSG:5186) coordinates for known bridge-adjacent
+    /// bus stops, to anchor a MOCT_LINK search for the actual bridge deck
+    /// links (SPEC_Bridge §9's own open question -- no bridge field exists,
+    /// so this locates them by coordinate instead).
+    #[test]
+    fn print_bridge_anchor_en_coords() {
+        use crate::projection::korea_tm::KoreaTmProjection;
+        let points: &[(&str, f64, f64)] = &[
+            ("영도대교(mainland)", 35.097058333299998, 129.035885000000007),
+            ("영도대교.남포역 A", 35.097318312925999, 129.036016348338990),
+            ("영도대교.남포역 B", 35.097618222506000, 129.035894138741014),
+            ("대교사거리(yeongdo) A", 35.091462519426003, 129.039461913257014),
+            ("대교사거리(yeongdo) B", 35.091687649843998, 129.039220651682001),
+            ("부산대교입구", 35.093947115409001, 129.042384558165992),
+            ("봉래동교차로(yeongdo)", 35.093409881273999, 129.043695884984004),
+            ("중앙동(mainland) A", 35.105587700000001, 129.036016600000011),
+            ("중앙동(mainland) B", 35.106248579999999, 129.036372999999998),
+        ];
+        for &(name, lat, lon) in points {
+            let (e, n) = KoreaTmProjection::project_raw(lat, lon);
+            println!("{name}: lat={lat} lon={lon} -> E={e:.2} N={n:.2}");
+        }
+    }
 }

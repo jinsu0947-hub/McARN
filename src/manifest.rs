@@ -98,6 +98,21 @@ impl Manifest {
 /// is decided deep inside `ground::generate_ground_data` and only printed to
 /// stdout (`elevation::selector::select_provider`), not returned to the
 /// caller, so it isn't threaded through to here for M0.
+/// A `sources[]` entry for 표준노드링크 (SPEC_Build.md §3.1's own schema
+/// example: `{"name": "표준노드링크", "version": "...", "retrieved": "..."}`).
+/// `version` has no real dataset version to report (the distribution isn't
+/// itself versioned the way a software release is) -- `dir_label`, when
+/// given, is the source directory's own name (e.g. this project's
+/// `[2026-08-12]NODELINKDATA` folder already encodes an acquisition date),
+/// which is a more useful provenance string than this crate's own version.
+pub fn road_network_source_entry(dir_label: Option<&str>) -> serde_json::Value {
+    json!({
+        "name": "표준노드링크",
+        "version": dir_label.unwrap_or(env!("CARGO_PKG_VERSION")),
+        "retrieved": now_iso8601_utc(),
+    })
+}
+
 pub fn elevation_source_entry() -> serde_json::Value {
     json!({
         "name": "고도데이터",

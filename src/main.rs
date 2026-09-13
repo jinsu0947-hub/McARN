@@ -665,10 +665,19 @@ fn run_cli() {
                 xzbbox.max_x(),
                 xzbbox.max_z(),
             ],
-            sources: if ground.elevation_enabled {
-                vec![manifest::elevation_source_entry()]
-            } else {
-                vec![]
+            sources: {
+                let mut sources = Vec::new();
+                if ground.elevation_enabled {
+                    sources.push(manifest::elevation_source_entry());
+                }
+                if let Some(dir) = &args.kr_roads_dir {
+                    let dir_label = dir.file_name().and_then(|n| n.to_str());
+                    sources.push(manifest::road_network_source_entry(dir_label));
+                }
+                if args.kr_bus_stops_dir.is_some() && args.kr_bus_routes_csv.is_some() {
+                    sources.push(manifest::bus_route_source_entry(crate::kr_bus_routes::REFERENCE_DATE));
+                }
+                sources
             },
         }
     });
