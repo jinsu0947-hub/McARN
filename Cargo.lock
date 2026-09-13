@@ -203,6 +203,7 @@ dependencies = [
  "crc",
  "dda-voxelize",
  "dirs",
+ "encoding_rs",
  "fastanvil",
  "fastnbt",
  "flate2",

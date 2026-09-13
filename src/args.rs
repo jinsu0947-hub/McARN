@@ -87,6 +87,20 @@ pub struct Args {
     #[arg(long = "kr-roads-dir")]
     pub kr_roads_dir: Option<std::path::PathBuf>,
 
+    /// SPEC_Build.md M2: directory containing the 부산 버스 정류소 SHP
+    /// (`tl_bus_station_info.shp`/`.dbf`). Only read for `--input-source kr`
+    /// together with `--kr-bus-routes-csv`; omitting either keeps the M0/M1
+    /// terrain+road behaviour (no `stops.json`, no L0 buffer chunk scoping).
+    #[arg(long = "kr-bus-stops-dir")]
+    pub kr_bus_stops_dir: Option<std::path::PathBuf>,
+
+    /// SPEC_Build.md M2: path to the 부산 버스노선별 승하차 정보 CSV
+    /// (route number/stop order/stop code/stop name -- see
+    /// `kr_bus_routes`'s module doc for why only those four columns matter
+    /// and why the file's own baseline date gets recorded verbatim).
+    #[arg(long = "kr-bus-routes-csv")]
+    pub kr_bus_routes_csv: Option<std::path::PathBuf>,
+
     /// Resolved once, by `apply_input_source_defaults`, from `--bbox-en` or
     /// by converting `--bbox` -- SPEC_Ingest.md §2.1's "read once and
     /// convert" applied to extent, not just per-point CRS lookup: every call

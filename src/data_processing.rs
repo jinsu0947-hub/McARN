@@ -915,9 +915,64 @@ pub fn generate_world_with_options(
             None
         };
 
+    // SPEC_Build.md M2 "정류소 좌표 배치" / "생성 대상 청크 목록": solved
+    // once, here, alongside the M1 road network -- see `kr_transit`'s module
+    // doc. Only runs when both `--kr-bus-stops-dir` and `--kr-bus-routes-csv`
+    // are given; omitting either keeps M0/M1 behaviour completely unchanged
+    // (no `stops.json`, no buffer-based tile scoping) -- existing runs, KR
+    // or otherwise, are unaffected by this flag's mere existence.
+    let kr_buffer_tiles: Option<HashSet<(i32, i32)>> = if args.input_source == crate::args::InputSource::Kr {
+        if let (Some(bus_stops_dir), Some(bus_routes_csv)) = (&args.kr_bus_stops_dir, &args.kr_bus_routes_csv) {
+            let planar = args
+                .korea_planar_bbox
+                .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
+            let roads_dir = args.kr_roads_dir.as_ref().expect(
+                "validate_args requires --kr-roads-dir alongside --kr-bus-stops-dir/--kr-bus-routes-csv \
+                 (M2's route polylines route through M1's own 표준노드링크 graph)",
+            );
+            match crate::kr_transit::build_m2(bus_stops_dir, bus_routes_csv, roads_dir, &planar, args.scale) {
+                Ok((doc, reports, chunks)) => {
+                    crate::kr_transit::print_route_report(&reports);
+                    let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
+                    if let Err(e) = crate::kr_transit::write_stops_json(&graph_output_dir, &doc) {
+                        eprintln!("Warning: KR transit: failed to write stops.json: {e}");
+                    }
+                    // Chunk (16-block) -> tile (512-block, `tile::DEFAULT_TILE_SIZE`)
+                    // granularity: `create_tiles` and the tile loop below only ever
+                    // skip or keep a whole tile, never part of one.
+                    let buffer_tiles: HashSet<(i32, i32)> =
+                        chunks.into_iter().map(|(cx, cz)| (cx.div_euclid(32), cz.div_euclid(32))).collect();
+                    println!("KR transit: L0 buffer covers {} tile(s) of 512 blocks each", buffer_tiles.len());
+                    Some(buffer_tiles)
+                }
+                Err(e) => {
+                    eprintln!("Warning: KR transit (M2) failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Decide between sequential and parallel processing based on world size.
     // Tile subdivision is aligned to 512-block Minecraft region boundaries.
     let tiles = tile::create_tiles(&xzbbox, tile::DEFAULT_TILE_SIZE);
+    // SPEC_GenerationScope.md §0: "띠 밖 청크는 ... 아예 생성하지 않는다" --
+    // drop every tile the M2 buffer doesn't reach *before* the parallel-vs-
+    // sequential decision and element assignment below, so nothing (not even
+    // an empty WorldEditor) is ever created for it. `None` (the flag wasn't
+    // given, or M2 failed) leaves every tile in place -- unchanged behaviour.
+    let tiles: Vec<tile::TileBounds> = if let Some(buffer_tiles) = &kr_buffer_tiles {
+        let before = tiles.len();
+        let kept: Vec<_> = tiles.into_iter().filter(|t| buffer_tiles.contains(&(t.min_x >> 9, t.min_z >> 9))).collect();
+        println!("KR transit: buffer scoping kept {}/{before} tile(s)", kept.len());
+        kept
+    } else {
+        tiles
+    };
 
     // Tile editors are created as JavaAnvil (WorldEditor::new), so their
     // format-dependent block-entity schema (banners) only matches Java output.

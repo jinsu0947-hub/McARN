@@ -69,6 +69,7 @@
 //!   (the sampled records' apparent "normal road" code) -- not a confirmed
 //!   code table, so treat this field as low-confidence.
 
+pub mod routing;
 pub mod shapefile;
 
 use crate::coordinate_system::cartesian::{XZBBox, XZPoint};
@@ -395,7 +396,7 @@ fn clip(nodes: Vec<RawNode>, links: Vec<RawLink>, en_bbox: (f64, f64, f64, f64))
 /// §2.2's own formula, reusing this run's already-resolved origin -- the
 /// same transform `main.rs` uses for everything else, so road geometry lands
 /// exactly where the rest of the world expects it.
-fn en_to_block(e: f64, n: f64, planar: &KoreaPlanarBBox, scale: f64) -> (f64, f64) {
+pub(crate) fn en_to_block(e: f64, n: f64, planar: &KoreaPlanarBBox, scale: f64) -> (f64, f64) {
     let x = (e - planar.e_min()) * scale;
     let z = (planar.n_min() - n) * scale; // north = -Z (per §2.2)
     // n_min was the *south* edge in the original formula's convention (E0/N0

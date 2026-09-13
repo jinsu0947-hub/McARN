@@ -107,6 +107,20 @@ pub fn elevation_source_entry() -> serde_json::Value {
     })
 }
 
+/// A `sources[]` entry for the bus route data actually used
+/// (SPEC_Build.md §3.1: "`sources`의 기준일도 필수다. 버스 노선은 2025년
+/// 개편 이후 여러 차례 바뀌었으므로, 어느 시점 기준인지가 기록되지 않으면
+/// 재현이 불가능하다"). `baseline_date` is the source data's own as-of date
+/// (e.g. `kr_bus_routes::REFERENCE_DATE`), not today's date -- `retrieved`
+/// already covers when this run happened.
+pub fn bus_route_source_entry(baseline_date: &str) -> serde_json::Value {
+    json!({
+        "name": "버스노선",
+        "baseline_date": baseline_date,
+        "retrieved": now_iso8601_utc(),
+    })
+}
+
 fn now_iso8601_utc() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

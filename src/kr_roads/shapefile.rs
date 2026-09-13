@@ -1,8 +1,9 @@
-//! Minimal, read-only ESRI Shapefile (.shp) + dBASE (.dbf) reader, scoped to
-//! exactly what SPEC_Ingest.md §3 needs from 표준노드링크: point geometry
-//! (nodes) and polyline geometry (links), plus their attribute tables. No
-//! crate for this exists in `Cargo.toml` and this build runs `--offline`
-//! (no network to fetch one), so this is hand-rolled against the public ESRI
+//! Minimal, read-only ESRI Shapefile (.shp) + dBASE (.dbf) reader, built for
+//! SPEC_Ingest.md §3's 표준노드링크 (point + polyline geometry, attribute
+//! tables) and reused as-is for the 부산 버스 정류소 point shapefile -- both
+//! are plain ESRI shapefiles, nothing here is 표준노드링크-specific. No crate
+//! for this exists in `Cargo.toml` and this build runs `--offline` (no
+//! network to fetch one), so this is hand-rolled against the public ESRI
 //! Shapefile Technical Description and the dBASE III+ file format -- both
 //! simple, stable, well-documented binary formats.
 
@@ -21,6 +22,21 @@ struct DbfField {
     len: usize,
 }
 
+/// How a table's text fields are decoded, detected once at `open()` time
+/// from the `.dbf`'s sibling `.cpg` file (the shapefile spec's own way of
+/// declaring a dBASE table's codepage). MOCT's `.cpg` says `949` (CP949);
+/// the bus-stop table's says `UTF-8`. Only these two are handled -- CP949 is
+/// a full DBCS table not worth hand-rolling (see `decode_cp949_lossy`) and
+/// no third codepage has shown up in a source this project reads yet.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextEncoding {
+    Utf8,
+    /// ASCII passes through; any non-ASCII byte becomes `?`. Correct for
+    /// fields this crate actually parses as data (IDs, digits, codes -- pure
+    /// ASCII); Korean text under this encoding is display-only.
+    AsciiLossy,
+}
+
 /// A parsed dBASE table: field layout plus raw records, still to be sliced by
 /// field name per row. Deleted records (leading `0x2A`) are skipped -- MOCT's
 /// distributions do not carry any in the samples this was built against, but
@@ -31,6 +47,21 @@ pub struct DbfTable {
     record_len: usize,
     records: Vec<u8>,
     num_records: usize,
+    encoding: TextEncoding,
+}
+
+/// Reads `path`'s sibling `.cpg` (same stem, `.cpg` extension), if any, and
+/// classifies it. Absent file or unrecognised content both fall back to
+/// `AsciiLossy` -- MOCT's samples were built and verified against before any
+/// `.cpg` was known to exist, so an unreadable one must not change behaviour.
+fn detect_encoding(dbf_path: &Path) -> TextEncoding {
+    let cpg_path = dbf_path.with_extension("cpg");
+    match fs::read_to_string(&cpg_path) {
+        Ok(content) if content.to_uppercase().contains("UTF-8") || content.to_uppercase().contains("UTF8") => {
+            TextEncoding::Utf8
+        }
+        _ => TextEncoding::AsciiLossy,
+    }
 }
 
 impl DbfTable {
@@ -71,6 +102,7 @@ impl DbfTable {
             record_len,
             records,
             num_records,
+            encoding: detect_encoding(path),
         })
     }
 
@@ -98,10 +130,18 @@ impl DbfTable {
         if end > self.records.len() {
             return String::new();
         }
-        // MOCT's Korean text fields (ROAD_NAME, REMARK, ...) are EUC-KR/CP949,
-        // not UTF-8 -- decoded lossily since only ASCII fields (IDs, LANES,
-        // ROAD_RANK) are ever parsed as data; Korean text is display-only.
-        decode_cp949_lossy(&self.records[start..end]).trim().to_string()
+        let raw = &self.records[start..end];
+        match self.encoding {
+            // Genuinely UTF-8 (bus-stop table's `.cpg` says so): decode for
+            // real, so Korean text (`bstopnm`, ...) comes back readable, not
+            // just display-safe.
+            TextEncoding::Utf8 => String::from_utf8_lossy(raw).trim().to_string(),
+            // MOCT's Korean text fields (ROAD_NAME, REMARK, ...) are CP949,
+            // not UTF-8 -- decoded lossily since only ASCII fields (IDs,
+            // LANES, ROAD_RANK) are ever parsed as data; Korean text is
+            // display-only.
+            TextEncoding::AsciiLossy => decode_cp949_lossy(raw).trim().to_string(),
+        }
     }
 
     fn is_deleted(&self, record_index: usize) -> bool {
