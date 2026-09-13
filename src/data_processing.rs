@@ -868,6 +868,53 @@ pub fn generate_world_with_options(
         (sx >> 9, sz >> 9)
     });
 
+    // SPEC_Build.md M1 / SPEC_Ingest.md §6 step 5 ("도로 종단선형"): solved
+    // once, here, before the tile loop -- see `kr_roads`'s module doc for why
+    // the network solve (needs only `Ground`, never evicted) and block
+    // placement (needs a `WorldEditor`, which large runs evict from under a
+    // post-merge pass) are split. `Arc` so the parallel tile closures below
+    // can share it without recomputing or re-reading the shapefiles per tile.
+    let kr_road_network: Option<Arc<crate::kr_roads::KrRoadNetwork>> =
+        if args.input_source == crate::args::InputSource::Kr {
+            if let Some(roads_dir) = &args.kr_roads_dir {
+                let planar = args
+                    .korea_planar_bbox
+                    .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
+                let (network, report) = crate::kr_roads::compute_kr_road_network(
+                    ground.as_ref(),
+                    &xzbbox,
+                    &planar,
+                    args.scale,
+                    roads_dir,
+                )
+                .map_err(|e| format!("KR roads: {e}"))?;
+                println!(
+                    "KR roads: {} nodes, {} segments solved ({} links skipped for a missing node); \
+                     slope violations: {}, node height mismatches: {}",
+                    report.nodes_placed,
+                    report.segments_placed,
+                    report.links_skipped_missing_node,
+                    report.slope_violations,
+                    report.node_height_mismatches
+                );
+                let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
+                if let Err(e) = crate::kr_roads::write_roadgraph_json(
+                    &graph_output_dir,
+                    &xzbbox,
+                    &network.segments,
+                    &network.node_pos,
+                    &network.node_y2,
+                ) {
+                    eprintln!("Warning: KR roads: failed to write roadgraph.json: {e}");
+                }
+                Some(Arc::new(network))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
     // Decide between sequential and parallel processing based on world size.
     // Tile subdivision is aligned to 512-block Minecraft region boundaries.
     let tiles = tile::create_tiles(&xzbbox, tile::DEFAULT_TILE_SIZE);
@@ -1124,6 +1171,25 @@ pub fn generate_world_with_options(
                             &mut tile_editor,
                             &tile_tunnel_cells,
                         );
+                    }
+
+                    // SPEC_Build.md M1 step 6 ("도로 배치"): same reasoning as the
+                    // tunnel carves just above -- a post-merge pass can't reach a
+                    // region that eviction already flushed, so place in-tile,
+                    // mirroring how `tile_assignments` already hands every OSM
+                    // linear element (roads, railways) to *every* tile its
+                    // geometry intersects. `Segment::aabb` is pre-padded by that
+                    // grade's full section width, so this doesn't miss the sweep's
+                    // sideways splash near a tile boundary.
+                    if let Some(network) = &kr_road_network {
+                        let matching = network.segments.iter().filter(|seg| {
+                            let (min_x, max_x, min_z, max_z) = seg.aabb();
+                            min_x < tile_bounds.max_x
+                                && max_x >= tile_bounds.min_x
+                                && min_z < tile_bounds.max_z
+                                && max_z >= tile_bounds.min_z
+                        });
+                        crate::kr_roads::place_segments(&mut tile_editor, matching);
                     }
 
                     let tile_road_overrides = tile_editor.take_road_surface_overrides();
@@ -1403,53 +1469,14 @@ pub fn generate_world_with_options(
         );
     }
 
-    // SPEC_Build.md M1 / SPEC_Ingest.md §6 step 6 ("도로 배치"): after terrain
-    // (step 4) and before any future building/street-furniture stage (§6
-    // steps 7-9), on this *same* editor -- never a separately reopened one
-    // (see `kr_roads`'s module doc for why that corrupted terrain the first
-    // time this was tried). Only runs for `--input-source kr` with
-    // `--kr-roads-dir` given; omitting the flag keeps terrain-only behaviour.
-    if args.input_source == crate::args::InputSource::Kr {
-        if let Some(roads_dir) = &args.kr_roads_dir {
-            if eviction_active {
-                // This pass reads terrain heights from `Ground` (never evicted) but
-                // *writes* blocks straight into `editor`, which a large/eviction run
-                // has already been streaming resident regions out of since partway
-                // through the tile loop above -- writes there would light up fresh,
-                // empty regions instead of landing on the terrain that used to be
-                // resident. Not handled yet (this run is small enough that eviction
-                // never activates); skip with a clear message rather than silently
-                // placing roads with holes in them.
-                eprintln!(
-                    "Warning: KR roads generation skipped -- this world streamed regions to disk \
-                     (eviction_active), which this pass does not yet support."
-                );
-            } else {
-                let planar = args
-                    .korea_planar_bbox
-                    .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
-                let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
-                match crate::kr_roads::generate_kr_roads(
-                    &mut editor,
-                    ground.as_ref(),
-                    &xzbbox,
-                    &planar,
-                    args.scale,
-                    roads_dir,
-                    &graph_output_dir,
-                ) {
-                    Ok(report) => println!(
-                        "KR roads: {} nodes, {} segments placed ({} links skipped for a missing node); \
-                         slope violations: {}, node height mismatches: {}",
-                        report.nodes_placed,
-                        report.segments_placed,
-                        report.links_skipped_missing_node,
-                        report.slope_violations,
-                        report.node_height_mismatches
-                    ),
-                    Err(e) => eprintln!("Warning: KR roads generation failed: {e}"),
-                }
-            }
+    // SPEC_Build.md M1 / SPEC_Ingest.md §6 step 6 ("도로 배치"), small-world
+    // sequential path only: the parallel path already placed every segment
+    // per-tile above (see the `kr_road_network` filter in the tile closure
+    // and the module doc for why). Here there is only ever one, non-evicting
+    // editor, so no filtering is needed -- place every segment directly.
+    if !use_parallel_tiles {
+        if let Some(network) = &kr_road_network {
+            crate::kr_roads::place_segments(&mut editor, &network.segments);
         }
     }
 

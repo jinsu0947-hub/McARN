@@ -16,14 +16,42 @@
 //! `save()` only ever preserves chunks *this session* touched, replacing
 //! everything else with empty filler -- see the git history for the
 //! writeup). Reading H0 from `Ground` directly (not from placed blocks)
-//! is what makes this safe regardless of whether the terrain pass ran
-//! per-tile or on the merged editor, and regardless of region eviction.
+//! is what makes the *network solve* safe regardless of whether the terrain
+//! pass ran per-tile or on the merged editor, and regardless of region
+//! eviction.
+//!
+//! **Placement is a separate concern from the solve, because of eviction.**
+//! A large/borough-scale run always enables `eviction_active`
+//! (`data_processing::should_stream_to_disk`): tiles are merged into the
+//! main editor and, once a region's owner tile and all 8 neighbours have
+//! merged, that region is flushed to disk and dropped from memory. A single
+//! post-merge pass writing straight into the main editor -- which is what
+//! this module did at first -- runs *after* the tile loop, by which point
+//! early regions are already gone; `set_block_absolute` there either drops
+//! the write (region flushed) or resurrects an empty region (not flushed
+//! yet, but never touched by *this* session, so `save()`'s no-disk-read
+//! rule empties it) -- corrupting the exact same way the original
+//! reopened-`WorldEditor` bug did, just via a different door. So placement
+//! is split from the solve:
+//! - [`compute_kr_road_network`] runs once, before the tile loop, needs only
+//!   `Ground` (never evicted) and produces plain data (`KrRoadNetwork`) --
+//!   no `WorldEditor` involved, so nothing here can be evicted out from
+//!   under it.
+//! - [`place_segments`] writes blocks for a slice of that data into whatever
+//!   `WorldEditor` is handed to it. `data_processing.rs` calls it twice:
+//!   once per tile inside the parallel tile closure (each call filtered to
+//!   the segments whose bounding box reaches that tile, mirroring how
+//!   `tile::assign_elements_to_tiles` already assigns long OSM ways/railways
+//!   to *every* tile they intersect) so every write lands before its region
+//!   can be evicted; and once, unfiltered, for the small-world sequential
+//!   path where there is only ever one non-evicting editor to write into.
 //!
 //! Future stages (M3 교량, M4 건물, M5 가로 요소) slot in the same way: each
 //! is its own function taking `&mut WorldEditor` + whatever inputs it needs,
 //! called from `generate_world_with_options` in SPEC_Ingest.md §6's order,
 //! all before that one `editor.save()`. None of them should ever construct
-//! their own `WorldEditor`.
+//! their own `WorldEditor`; any that places wide/long geometry should follow
+//! `place_segments`'s split rather than writing in one post-merge pass.
 //!
 //! Explicitly out of scope this pass (disclosed, not silently dropped):
 //! - SPEC_RoadProfile P3's structure classification (ELEVATED/TUNNEL) reads
@@ -124,34 +152,54 @@ impl RoadClass {
     }
 }
 
-/// SPEC_RoadSection.md §2's six grades, reduced to what the sweep (P6/P7)
-/// needs: total half-width from the centerline, how many of those blocks
-/// (at the outer edge) are sidewalk, and whether a curb course separates
-/// them from the roadway. Widths are each grade's own `총 폭 / 2` (rounded
-/// down; C/D's odd total gives the left side the extra block, §
-/// `cross_section` for exactly where) -- SPEC_RoadSection.md's own worked
-/// example (D: `[인도4][연석][차도5][중앙선1][차도5][연석][인도4]`) and its
-/// summary table's per-column widths do not reduce to the same sub-split
-/// (curb/median accounting differs between the two), so this only commits to
-/// matching the table's headline **총 폭**, the number the spec repeats in
-/// every row and the one this task's automated checks can verify against
-/// the placed blocks. Sub-splitting inside that total is this module's own
-/// choice, disclosed here rather than presented as a spec-derived value.
+/// SPEC_RoadSection.md §2 (2026-09-13 재계산), one field per column of that
+/// table's own layout:
+///
+/// ```text
+/// [outer_each][curb_each][carriage_each][median_total][carriage_each][curb_each][outer_each]
+/// ```
+///
+/// `outer_each`/`curb_each`/`carriage_each` are each **one side's** width
+/// (both sides equal); `median_total` is the *whole* median, not halved --
+/// it is 0 (E/F, no median), 1 (C/D, a single painted centerline), or 4
+/// (A/B, a physical divider), matching §1's own units exactly. This makes
+/// `total_width()` a direct sum against the table's **총 폭** column, so a
+/// test can assert every grade reproduces its documented total instead of
+/// trusting the split by construction.
+///
+/// `outer_is_shoulder` distinguishes A's 갓길 (paved like the carriageway,
+/// flush height, no braille/curb-top pattern) from every other grade's real
+/// 인도 (raised on the curb, light_gray/andesite pattern) -- SPEC_RoadSection
+/// §2's A example still puts a curb column between carriageway and 갓길, so
+/// the curb stays; only the outer band's own material/height differs.
 struct SectionSpec {
-    half_total: i32,
-    sidewalk_each: i32,
-    has_curb: bool,
-    has_median_tint: bool,
+    outer_each: i32,
+    curb_each: i32,
+    carriage_each: i32,
+    median_total: i32,
+    outer_is_shoulder: bool,
+}
+
+impl SectionSpec {
+    fn total_width(&self) -> i32 {
+        2 * (self.outer_each + self.curb_each + self.carriage_each) + self.median_total
+    }
 }
 
 fn section_spec(class: RoadClass) -> SectionSpec {
     match class {
-        RoadClass::A => SectionSpec { half_total: 24, sidewalk_each: 0, has_curb: false, has_median_tint: true },
-        RoadClass::B => SectionSpec { half_total: 26, sidewalk_each: 4, has_curb: true, has_median_tint: true },
-        RoadClass::C => SectionSpec { half_total: 16, sidewalk_each: 4, has_curb: true, has_median_tint: true },
-        RoadClass::D => SectionSpec { half_total: 10, sidewalk_each: 4, has_curb: true, has_median_tint: true },
-        RoadClass::E => SectionSpec { half_total: 8, sidewalk_each: 3, has_curb: false, has_median_tint: false },
-        RoadClass::F => SectionSpec { half_total: 4, sidewalk_each: 0, has_curb: false, has_median_tint: false },
+        // 총 50: 갓길4 + 연석1 + 차도18 + 분리대4 + 차도18 + 연석1 + 갓길4
+        RoadClass::A => SectionSpec { outer_each: 4, curb_each: 1, carriage_each: 18, median_total: 4, outer_is_shoulder: true },
+        // 총 50: 인도4 + 연석1 + 차도18 + 분리대4 + 차도18 + 연석1 + 인도4
+        RoadClass::B => SectionSpec { outer_each: 4, curb_each: 1, carriage_each: 18, median_total: 4, outer_is_shoulder: false },
+        // 총 31: 인도4 + 연석1 + 차도10 + 중앙선1 + 차도10 + 연석1 + 인도4
+        RoadClass::C => SectionSpec { outer_each: 4, curb_each: 1, carriage_each: 10, median_total: 1, outer_is_shoulder: false },
+        // 총 21: 인도4 + 연석1 + 차도5 + 중앙선1 + 차도5 + 연석1 + 인도4
+        RoadClass::D => SectionSpec { outer_each: 4, curb_each: 1, carriage_each: 5, median_total: 1, outer_is_shoulder: false },
+        // 총 20: 인도4 + 연석1 + 차도5 + 차도5 + 연석1 + 인도4 (중앙 없음)
+        RoadClass::E => SectionSpec { outer_each: 4, curb_each: 1, carriage_each: 5, median_total: 0, outer_is_shoulder: false },
+        // 총 8: 단일 포장면, 인도/연석/중앙 없음
+        RoadClass::F => SectionSpec { outer_each: 0, curb_each: 0, carriage_each: 4, median_total: 0, outer_is_shoulder: false },
     }
 }
 
@@ -202,14 +250,14 @@ fn road_class(road_rank: &str, lanes: i32) -> RoadClass {
 
 /// One resampled centerline point, ~1 per Minecraft block, carrying enough
 /// to write `roadgraph.json`'s `segments[].points[]` and to sweep P6/P7.
-struct ProfilePoint {
+pub struct ProfilePoint {
     x: i32,
     z: i32,
     /// Half-block height unit (SPEC_RoadProfile.md §1.1).
     y2: i32,
 }
 
-struct Segment {
+pub struct Segment {
     id: String,
     link_id: String,
     lanes: i32,
@@ -219,6 +267,28 @@ struct Segment {
     f_node: String,
     t_node: String,
     points: Vec<ProfilePoint>,
+}
+
+impl Segment {
+    /// `(min_x, max_x, min_z, max_z)` over this segment's centerline points,
+    /// padded by its own grade's full cross-section width -- generous enough
+    /// that any tile whose (halo-expanded) bounds this overlaps is guaranteed
+    /// to cover every block `place_segments` sweeps for it, without needing
+    /// to know the tile grid's halo constant here.
+    pub fn aabb(&self) -> (i32, i32, i32, i32) {
+        let pad = section_spec(self.class).total_width();
+        let mut min_x = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut min_z = i32::MAX;
+        let mut max_z = i32::MIN;
+        for p in &self.points {
+            min_x = min_x.min(p.x);
+            max_x = max_x.max(p.x);
+            min_z = min_z.min(p.z);
+            max_z = max_z.max(p.z);
+        }
+        (min_x - pad, max_x + pad, min_z - pad, max_z + pad)
+    }
 }
 
 /// What the CLI/report prints after a run -- SPEC_RoadProfile.md §6's
@@ -522,6 +592,55 @@ fn coord_hash(x: i32, z: i32) -> u32 {
     (h as u32).wrapping_mul(2_246_822_519)
 }
 
+/// One column of `cross_section_layout`'s output: how far from the
+/// centerline point (in perpendicular-direction blocks, signed) and which
+/// SPEC_RoadSection.md §2 band it falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Band {
+    Sidewalk,
+    Shoulder,
+    Curb,
+    Carriage,
+    MedianPaint,
+    MedianPhysical,
+}
+
+/// Expands a `SectionSpec` into left-to-right band + signed-offset pairs
+/// covering exactly `total_width()` columns, laid out as SPEC_RoadSection.md
+/// §2 writes it:
+/// `[outer][curb][carriage][median][carriage][curb][outer]`.
+/// Offsets are centered on 0 as evenly as an integer split allows (extra
+/// leftover column, when `total_width()` is even, lands just left of
+/// center) -- there is no requirement that the two sides mirror exactly to
+/// the block, only that the total and each band's own width match §2.
+fn cross_section_layout(spec: &SectionSpec) -> Vec<(i32, Band)> {
+    let median_band = if spec.median_total == 0 {
+        Vec::new()
+    } else if spec.median_total == 1 {
+        vec![Band::MedianPaint]
+    } else {
+        vec![Band::MedianPhysical; spec.median_total as usize]
+    };
+    let outer_band = if spec.outer_is_shoulder { Band::Shoulder } else { Band::Sidewalk };
+
+    let mut sequence = Vec::with_capacity(spec.total_width() as usize);
+    sequence.extend(std::iter::repeat(outer_band).take(spec.outer_each as usize));
+    sequence.extend(std::iter::repeat(Band::Curb).take(spec.curb_each as usize));
+    sequence.extend(std::iter::repeat(Band::Carriage).take(spec.carriage_each as usize));
+    sequence.extend(median_band.iter().copied());
+    sequence.extend(std::iter::repeat(Band::Carriage).take(spec.carriage_each as usize));
+    sequence.extend(std::iter::repeat(Band::Curb).take(spec.curb_each as usize));
+    sequence.extend(std::iter::repeat(outer_band).take(spec.outer_each as usize));
+
+    let total = sequence.len() as i32;
+    let left_extent = total / 2;
+    sequence
+        .into_iter()
+        .enumerate()
+        .map(|(i, band)| (i as i32 - left_extent, band))
+        .collect()
+}
+
 /// SPEC_RoadProfile.md P6/P7 + SPEC_RoadSection.md §1/§2, combined: sweeps
 /// the fixed cross-section for `class` across the perpendicular at `point`,
 /// writing roadway/curb/sidewalk blocks at `y2`. `dir` is the (unit-ish)
@@ -541,33 +660,40 @@ fn sweep_and_place(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: Roa
         editor.set_block_absolute(block, px, y, pz, None, None);
     };
 
-    for side in [-1i32, 1i32] {
-        for offset in 0..=spec.half_total {
-            let px = x + (perp.0 * (offset * side) as f64).round() as i32;
-            let pz = z + (perp.1 * (offset * side) as f64).round() as i32;
+    for (offset, band) in cross_section_layout(&spec) {
+        let px = x + (perp.0 * offset as f64).round() as i32;
+        let pz = z + (perp.1 * offset as f64).round() as i32;
 
-            let from_edge = spec.half_total - offset;
-            let is_sidewalk = from_edge < spec.sidewalk_each;
-            let is_curb = spec.has_curb && from_edge == spec.sidewalk_each;
-            let is_median = spec.has_median_tint && offset == 0;
-
-            if is_sidewalk {
+        match band {
+            Band::Sidewalk => {
                 let block = if coord_hash(px, pz) % 2 == 0 { LIGHT_GRAY_CONCRETE } else { POLISHED_ANDESITE };
                 let sidewalk_y2 = y2 + CURB_HEIGHT_Y2;
                 place_full(editor, block, px, pz, sidewalk_y2.div_euclid(2));
                 if sidewalk_y2.rem_euclid(2) == 1 {
                     place_full(editor, SMOOTH_STONE_SLAB, px, pz, sidewalk_y2.div_euclid(2) + 1);
                 }
-            } else if is_curb {
+            }
+            Band::Curb => {
                 place_full(editor, SMOOTH_STONE_SLAB, px, pz, y_full);
                 if has_slab {
                     place_full(editor, SMOOTH_STONE_SLAB, px, pz, y_full + 1);
                 }
-            } else {
+            }
+            Band::MedianPaint => {
+                place_full(editor, YELLOW_CONCRETE, px, pz, y_full);
+                if has_slab {
+                    place_full(editor, YELLOW_CONCRETE, px, pz, y_full + 1);
+                }
+            }
+            Band::MedianPhysical => {
+                place_full(editor, STONE_BRICKS, px, pz, y_full);
+                if has_slab {
+                    place_full(editor, STONE_BRICKS, px, pz, y_full + 1);
+                }
+            }
+            Band::Shoulder | Band::Carriage => {
                 let h = coord_hash(px, pz) % 100;
-                let block = if is_median {
-                    STONE_BRICKS
-                } else if h < 3 {
+                let block = if h < 3 {
                     BLACK_CONCRETE
                 } else if h < 8 {
                     LIGHT_GRAY_CONCRETE
@@ -597,6 +723,7 @@ struct GraphPoint {
     pos: [i32; 2],
     y2: i32,
     road_half_width: [i32; 2],
+    curb_width: [i32; 2],
     sidewalk_width: [i32; 2],
     structure: &'static str,
 }
@@ -623,22 +750,28 @@ struct RoadGraph {
     excluded: Vec<serde_json::Value>,
 }
 
-/// Entry point: loads, clips, solves, sweeps, writes `roadgraph.json`, and
-/// returns the counts SPEC_RoadProfile.md §6's automated checks report.
-/// `world_dir` must already contain M0's generated terrain -- this reopens
-/// it with a fresh `WorldEditor` rather than participating in the tile-
-/// parallel terrain generation pass, since road placement needs the *final*
-/// ground surface as its P4/P5 input (§ `ground_y_at`), not a tile's
-/// in-progress one.
-pub fn generate_kr_roads(
-    editor: &mut WorldEditor,
+/// Everything [`compute_kr_road_network`] solves, in a form that carries no
+/// `WorldEditor` reference and is cheap to wrap in `Arc` and share across the
+/// parallel tile closures in `data_processing.rs` -- see the module doc for
+/// why placement (which does need a `WorldEditor`) is a separate step.
+pub struct KrRoadNetwork {
+    pub segments: Vec<Segment>,
+    pub node_pos: HashMap<String, (i32, i32)>,
+    pub node_y2: HashMap<String, i32>,
+}
+
+/// Loads, clips, and solves (SPEC_RoadProfile.md P4/P5): produces the full
+/// road network as plain data and the counts SPEC_RoadProfile.md §6's
+/// automated checks report, but places no blocks and touches no
+/// `WorldEditor` -- see the module doc for why. Call once, before the tile
+/// loop; feed the result to [`place_segments`] and [`write_roadgraph_json`].
+pub fn compute_kr_road_network(
     ground: &Ground,
     xzbbox: &XZBBox,
     planar: &KoreaPlanarBBox,
     scale: f64,
     roads_dir: &Path,
-    graph_output_dir: &Path,
-) -> Result<KrRoadsReport, String> {
+) -> Result<(KrRoadNetwork, KrRoadsReport), String> {
     let (raw_nodes, raw_links) = load_raw(roads_dir)?;
     println!(
         "KR roads: loaded {} nodes, {} links from {}",
@@ -734,27 +867,7 @@ pub fn generate_kr_roads(
         });
     }
 
-    // P6/P7: sweep and write blocks into the *same* session's editor. No
-    // save here -- SPEC_Ingest.md §6 step 10 ("월드 쓰기") happens exactly
-    // once, in `generate_world_with_options`, after every staged pass
-    // (roads now, buildings/street-furniture later) has run.
-    let mut segments_placed = 0usize;
-    for seg in &segments {
-        for w in seg.points.windows(2) {
-            let dir = ((w[1].x - w[0].x) as f64, (w[1].z - w[0].z) as f64);
-            sweep_and_place(editor, w[0].x, w[0].z, w[0].y2, seg.class, dir);
-        }
-        if let Some(last) = seg.points.last() {
-            let dir = if seg.points.len() >= 2 {
-                let p = &seg.points[seg.points.len() - 2];
-                ((last.x - p.x) as f64, (last.z - p.z) as f64)
-            } else {
-                (1.0, 0.0)
-            };
-            sweep_and_place(editor, last.x, last.z, last.y2, seg.class, dir);
-        }
-        segments_placed += 1;
-    }
+    let segments_placed = segments.len();
 
     // Automated checks (SPEC_RoadProfile.md §6 "3번은 회귀 검사로 매 실행 후 자동 수행한다"),
     // run against the actual placed integer y2 values, not assumed from the solver's own constraints.
@@ -783,18 +896,46 @@ pub fn generate_kr_roads(
         }
     }
 
-    write_roadgraph_json(graph_output_dir, xzbbox, &segments, &node_pos, &node_y2)?;
-
-    Ok(KrRoadsReport {
+    let report = KrRoadsReport {
         nodes_placed: node_ids.len(),
         segments_placed,
         links_skipped_missing_node,
         slope_violations,
         node_height_mismatches,
-    })
+    };
+    Ok((KrRoadNetwork { segments, node_pos, node_y2 }, report))
 }
 
-fn write_roadgraph_json(
+/// SPEC_RoadProfile.md P6/P7: sweeps and writes blocks for `segments` into
+/// `editor`. No save here -- SPEC_Ingest.md §6 step 10 ("월드 쓰기") happens
+/// exactly once, in `generate_world_with_options`, after every staged pass
+/// (roads now, buildings/street-furniture later) has run.
+///
+/// Callers decide *which* segments and *which* editor -- see the module doc:
+/// the small-world sequential path calls this once with every segment and
+/// the single main editor; the parallel tile path calls it once per tile,
+/// with only the segments whose [`Segment::aabb`] reaches that tile, against
+/// that tile's own `WorldEditor`, before it is merged and its region can be
+/// evicted.
+pub fn place_segments<'a>(editor: &mut WorldEditor, segments: impl IntoIterator<Item = &'a Segment>) {
+    for seg in segments {
+        for w in seg.points.windows(2) {
+            let dir = ((w[1].x - w[0].x) as f64, (w[1].z - w[0].z) as f64);
+            sweep_and_place(editor, w[0].x, w[0].z, w[0].y2, seg.class, dir);
+        }
+        if let Some(last) = seg.points.last() {
+            let dir = if seg.points.len() >= 2 {
+                let p = &seg.points[seg.points.len() - 2];
+                ((last.x - p.x) as f64, (last.z - p.z) as f64)
+            } else {
+                (1.0, 0.0)
+            };
+            sweep_and_place(editor, last.x, last.z, last.y2, seg.class, dir);
+        }
+    }
+}
+
+pub fn write_roadgraph_json(
     dir: &Path,
     xzbbox: &XZBBox,
     segments: &[Segment],
@@ -826,7 +967,6 @@ fn write_roadgraph_json(
         .iter()
         .map(|s| {
             let spec = section_spec(s.class);
-            let road_half = spec.half_total - spec.sidewalk_each - i32::from(spec.has_curb);
             GraphSegment {
                 id: s.id.clone(),
                 link_id: s.link_id.clone(),
@@ -842,8 +982,9 @@ fn write_roadgraph_json(
                     .map(|p| GraphPoint {
                         pos: [p.x, p.z],
                         y2: p.y2,
-                        road_half_width: [road_half, road_half],
-                        sidewalk_width: [spec.sidewalk_each, spec.sidewalk_each],
+                        road_half_width: [spec.carriage_each, spec.carriage_each],
+                        curb_width: [spec.curb_each, spec.curb_each],
+                        sidewalk_width: [spec.outer_each, spec.outer_each],
                         structure: "ground",
                     })
                     .collect(),
@@ -906,6 +1047,39 @@ mod tests {
         assert_eq!(road_class("999", 2), RoadClass::E); // ambiguous D-or-E -> narrower default E
         assert_eq!(road_class("999", 0), RoadClass::F);
         assert_eq!(road_class("108", 1), RoadClass::F);
+    }
+
+    #[test]
+    fn section_spec_totals_match_spec_road_section_table() {
+        // SPEC_RoadSection.md §2's own **총 폭** column (2026-09-13 재계산).
+        let expected = [
+            (RoadClass::A, 50),
+            (RoadClass::B, 50),
+            (RoadClass::C, 31),
+            (RoadClass::D, 21),
+            (RoadClass::E, 20),
+            (RoadClass::F, 8),
+        ];
+        for (class, total) in expected {
+            let spec = section_spec(class);
+            assert_eq!(spec.total_width(), total, "{:?} total width", class);
+            let layout = cross_section_layout(&spec);
+            assert_eq!(layout.len() as i32, total, "{:?} layout column count", class);
+        }
+    }
+
+    #[test]
+    fn cross_section_layout_places_an_explicit_curb_column_where_the_table_says_so() {
+        // A/E previously had no curb column at all; §2's own worked examples
+        // put one between every carriageway and its outer band except F.
+        for class in [RoadClass::A, RoadClass::B, RoadClass::C, RoadClass::D, RoadClass::E] {
+            let spec = section_spec(class);
+            let layout = cross_section_layout(&spec);
+            let curb_columns = layout.iter().filter(|(_, b)| *b == Band::Curb).count();
+            assert_eq!(curb_columns, 2, "{:?} must have exactly one curb column on each side", class);
+        }
+        let f_layout = cross_section_layout(&section_spec(RoadClass::F));
+        assert!(f_layout.iter().all(|(_, b)| *b != Band::Curb), "F has no curb");
     }
 
     #[test]
