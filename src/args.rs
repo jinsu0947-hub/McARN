@@ -80,6 +80,13 @@ pub struct Args {
     #[arg(long = "bbox-en", allow_hyphen_values = true, value_parser = crate::projection::KoreaPlanarBBox::from_str)]
     pub bbox_en: Option<crate::projection::KoreaPlanarBBox>,
 
+    /// SPEC_Build.md M1: directory containing 표준노드링크's `MOCT_LINK.shp`/
+    /// `.dbf` and `MOCT_NODE.shp`/`.dbf` (e.g. the unzipped
+    /// `[...]NODELINKDATA` folder). Only read for `--input-source kr`; omit
+    /// to keep M0's terrain-only behaviour.
+    #[arg(long = "kr-roads-dir")]
+    pub kr_roads_dir: Option<std::path::PathBuf>,
+
     /// Resolved once, by `apply_input_source_defaults`, from `--bbox-en` or
     /// by converting `--bbox` -- SPEC_Ingest.md §2.1's "read once and
     /// convert" applied to extent, not just per-point CRS lookup: every call

@@ -6,6 +6,7 @@ use crate::coordinate_system::{
     geographic::LLBBox,
 };
 use crate::elevation::compute_grid_dims;
+use crate::elevation::postprocess::ElevationCompressionInfo;
 use crate::elevation_data::{fetch_elevation_data, ElevationData};
 use crate::land_cover::{self, LandCoverData};
 use crate::osm_parser::ProcessedElement;
@@ -201,6 +202,11 @@ impl Ground {
                 blocks_per_meter: 1.0,
                 slope_correction: 1.0,
                 ground_level: 0,
+                elevation_mapping: ElevationCompressionInfo {
+                    h_linear_m: 120.0,
+                    compression: 0.0,
+                    max_source_elevation_m: 0.0,
+                },
             }),
             land_cover: None,
             canopy: None,
@@ -656,6 +662,13 @@ impl Ground {
     /// minimum to report).
     pub fn min_elevation_m(&self) -> Option<f64> {
         self.elevation_data.as_ref().map(|d| d.min_height_m)
+    }
+
+    /// SPEC_Ingest.md §2.3's `H_LINEAR`/`compression`/max-source-elevation for
+    /// this run, for `manifest.json`'s `elevation_mapping`. `None` without
+    /// elevation data (flat ground never compressed anything).
+    pub fn elevation_mapping(&self) -> Option<ElevationCompressionInfo> {
+        self.elevation_data.as_ref().map(|d| d.elevation_mapping)
     }
 
     /// Vertical blocks per real-world metre, 1.0 without elevation (or with zero
@@ -1131,6 +1144,11 @@ mod tests {
                 blocks_per_meter: 1.0,
                 slope_correction: 1.0,
                 ground_level: 0,
+                elevation_mapping: ElevationCompressionInfo {
+                    h_linear_m: 120.0,
+                    compression: 0.0,
+                    max_source_elevation_m: 0.0,
+                },
             }),
             land_cover: None,
             canopy: None,
@@ -1244,6 +1262,11 @@ mod tests {
             blocks_per_meter: bpm,
             slope_correction: 1.0,
             ground_level: 0,
+            elevation_mapping: ElevationCompressionInfo {
+                h_linear_m: 120.0,
+                compression: 0.0,
+                max_source_elevation_m: min_m,
+            },
         };
         // 46 deg snow line is 3000 m; at 0.1 block/m from min 0 m, ground 64 => Y 364.
         assert_eq!(snow_threshold_for(&ed(0.0, 0.1), 46.0, 64), 364);
@@ -1392,6 +1415,11 @@ pub(crate) mod test_support {
                 blocks_per_meter: 1.0,
                 slope_correction: 1.0,
                 ground_level: 0,
+                elevation_mapping: ElevationCompressionInfo {
+                    h_linear_m: 120.0,
+                    compression: 0.0,
+                    max_source_elevation_m: 0.0,
+                },
             }),
             land_cover: Some(land_cover),
             canopy: None,

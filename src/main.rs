@@ -24,6 +24,7 @@ mod floodfill;
 mod floodfill_cache;
 mod ground;
 mod ground_generation;
+mod kr_roads;
 mod land_cover;
 mod landmarks;
 mod luanti_block_map;
@@ -649,6 +650,11 @@ fn run_cli() {
                 h0: ground.min_elevation_m(),
                 y2_base: -88,
             },
+            elevation_mapping: ground.elevation_mapping().map(|m| manifest::ManifestElevationMapping {
+                h_linear: m.h_linear_m,
+                compression: m.compression,
+                max_source_elevation: m.max_source_elevation_m,
+            }),
             bbox: [
                 xzbbox.min_x(),
                 xzbbox.min_z(),
@@ -685,12 +691,12 @@ fn run_cli() {
         part_groups,
     ) {
         Ok(_) => {
+            let manifest_dir = generation_path.parent().unwrap_or(&generation_path).to_path_buf();
             if let Some(m) = korea_manifest {
                 // SPEC_Build.md §3: written beside the world folder, not inside
                 // it, so it survives whatever a world browser does to the
                 // folder's own contents.
-                let manifest_dir = generation_path.parent().unwrap_or(&generation_path);
-                if let Err(e) = m.write(manifest_dir) {
+                if let Err(e) = m.write(&manifest_dir) {
                     eprintln!(
                         "{} Failed to write manifest.json: {}",
                         "Warning:".yellow().bold(),

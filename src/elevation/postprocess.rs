@@ -8,6 +8,13 @@ const MAX_Y: i32 = 319;
 /// Buffer at the top for buildings, trees, and other structures
 pub(crate) const TERRAIN_HEIGHT_BUFFER: i32 = 15;
 
+/// SPEC_Ingest.md §2.3 "고도 압축 매핑": below this absolute elevation (metres
+/// above sea level), `scale` applies in full -- the altitude band people and
+/// vehicles actually occupy (산복도로/시가지, ~100m) stays undistorted. Only
+/// higher ground compresses. Not yet a CLI flag; SPEC_Build.md M0 has no
+/// caller that would want a different value.
+pub(crate) const H_LINEAR_DEFAULT_M: f64 = 120.0;
+
 /// Largest water component a steep-slope shadow blob can be. Real bodies are bigger.
 const MAX_STEEP_WATER_AREA_M2: f64 = 250_000.0;
 
@@ -1729,14 +1736,105 @@ pub fn filter_elevation_outliers(height_grid: &mut [Vec<f64>]) {
     }
 }
 
+/// SPEC_Ingest.md §2.3 telemetry for one `scale_to_minecraft` call: the two
+/// parameters manifest.json's `elevation_mapping` records, plus the raw
+/// source maximum they were calibrated against. Without all three, a block
+/// Y cannot be inverted back to a real-world elevation -- `h0` (already in
+/// `manifest.json`'s `origin`) gives the bottom of the mapping, this struct
+/// gives the rest.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ElevationCompressionInfo {
+    /// `H_LINEAR`: the absolute elevation (m) below which `scale` is exact.
+    pub h_linear_m: f64,
+    /// The solved compression coefficient `k`. `0.0` means the relief fit
+    /// the available Y-range at full `scale` and no compression ran at all
+    /// -- `elevation_mapping` still records it so a reader never has to
+    /// guess whether compression applied.
+    pub compression: f64,
+    /// The raw grid's maximum elevation (m), i.e. what `compression` was
+    /// solved against (SPEC_Ingest.md §2.3: "대상 영역의 최대 표고에서 역산한다").
+    pub max_source_elevation_m: f64,
+}
+
+/// `compressed_height(0, ..)` is not necessarily 0 -- callers always take a
+/// *difference* of two calls (e.g. `compressed_height(h, ..) -
+/// compressed_height(h0, ..)`), never an absolute value on its own.
+///
+/// Below `h_linear`, or when `k <= 0.0` (compression off), this is exactly
+/// `scale * h` -- the pre-§2.3 uniform mapping. Above `h_linear` with `k >
+/// 0.0`, it switches to a logarithmic curve whose *value* and *slope* both
+/// match the linear branch at `h == h_linear` (continuity in both, per
+/// SPEC_Ingest.md §2.3 "배율 감소는 연속이어야 한다" -- a value-only match would
+/// still show up as a visible kink in the terrain). The local slope there is
+/// `scale / (1 + k*(h - h_linear))`: `scale` at the boundary, falling
+/// smoothly toward (but never reaching) 0 as `h` grows -- relief keeps
+/// climbing, it just climbs slower and slower, so nothing above `h_linear`
+/// is literally flattened.
+fn compressed_height(h: f64, h_linear: f64, scale: f64, k: f64) -> f64 {
+    if h <= h_linear || k <= 0.0 {
+        scale * h
+    } else {
+        scale * h_linear + (scale / k) * (1.0 + k * (h - h_linear)).ln()
+    }
+}
+
+/// SPEC_Ingest.md §2.3: "압축 후 최고 표고가 지형 상한 안에 들어오도록 계수를
+/// 대상 영역의 최대 표고에서 역산한다" -- solves for the smallest `k >= 0` such
+/// that the compressed span from `h_min` to `h_max` fits `target_span`.
+///
+/// `compressed_height(h_max, ..) - compressed_height(h_min, ..)` is
+/// continuous and non-increasing in `k` for fixed `h_min <= h_max` (larger
+/// `k` only ever compresses the part of `[h_min, h_max]` above `h_linear`
+/// harder), so bisection converges monotonically. Returns `0.0` (no
+/// compression) whenever the uncompressed span already fits, or whenever
+/// `h_max <= h_linear` -- compression cannot buy anything below `h_linear`
+/// by construction, so a relief that still does not fit fails the same way
+/// §2.3-less code always did (the caller's clamp catches it), not with a
+/// spurious "compressed" k that would not actually change the outcome.
+fn solve_compression_k(h_min: f64, h_max: f64, h_linear: f64, scale: f64, target_span: f64) -> f64 {
+    if h_max <= h_min {
+        return 0.0;
+    }
+    let uncompressed_span = scale * (h_max - h_min);
+    if uncompressed_span <= target_span || h_max <= h_linear || target_span <= 0.0 {
+        return 0.0;
+    }
+
+    let span_at = |k: f64| compressed_height(h_max, h_linear, scale, k) - compressed_height(h_min, h_linear, scale, k);
+
+    let mut lo = 0.0_f64;
+    let mut hi = 1.0_f64;
+    while span_at(hi) > target_span && hi < 1.0e12 {
+        hi *= 2.0;
+    }
+    for _ in 0..100 {
+        let mid = (lo + hi) * 0.5;
+        if span_at(mid) > target_span {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    hi
+}
+
 /// Scale raw elevation (meters) to Minecraft Y coordinates, keeping f64 precision.
 /// `extended_max_y` is the cap when `disable_height_limit` is on (Java datapack:
 /// 2031; Bedrock BP: 512; Luanti has no pack, so it keeps the vanilla ceiling);
 /// ignored otherwise.
-/// Scales real-world metre heights to Minecraft Y. Also returns the affine
-/// parameters `(min_height_m, blocks_per_meter)` so a real-world elevation can
-/// be converted back to a Minecraft Y threshold (e.g. for the snow line), plus the
-/// terrain base actually used (see `min_ground_level`).
+/// Scales real-world metre heights to Minecraft Y using SPEC_Ingest.md §2.3's
+/// segmented mapping (full `scale` up to `H_LINEAR`, logarithmic compression
+/// above it only if the relief needs it). Also returns the affine parameters
+/// `(min_height_m, blocks_per_meter)` so a real-world elevation can still be
+/// approximated as a single Minecraft-Y-per-metre slope (e.g. for the snow
+/// line, or the ground-texture slope thresholds -- both pre-date §2.3 and
+/// treat the whole grid as one linear slope; `blocks_per_meter` is that
+/// slope's grid-wide *average*, exact whenever compression did not fire and
+/// otherwise an approximation particularly above `H_LINEAR`, same caveat
+/// §2.3 already accepted by choosing one whole-grid `compression` value
+/// rather than a per-cell one), the terrain base actually used (see
+/// `min_ground_level`), and the `ElevationCompressionInfo` manifest.json's
+/// `elevation_mapping` is built from.
 ///
 /// `min_ground_level` is the lowest base the terrain may sink to. The base only sinks when
 /// the relief genuinely does not fit above `ground_level`, so a small bbox is not dropped
@@ -1748,7 +1846,7 @@ pub fn scale_to_minecraft(
     min_ground_level: i32,
     disable_height_limit: bool,
     extended_max_y: i32,
-) -> (Vec<Vec<f64>>, f64, f64, i32) {
+) -> (Vec<Vec<f64>>, f64, f64, i32, ElevationCompressionInfo) {
     // Derive min/max
     let (min_height, max_height) = blurred_heights
         .par_iter()
@@ -1811,36 +1909,40 @@ pub fn scale_to_minecraft(
 
     let available_y_range: f64 = (ceiling - ground_level) as f64;
 
-    let scaled_range: f64 = if ideal_scaled_range <= available_y_range {
+    // SPEC_Ingest.md §2.3: full `scale` never gives way to a single lower
+    // scale for the whole grid any more -- only the part above `H_LINEAR`
+    // compresses, and only as much as this specific area's relief needs.
+    let h_linear = H_LINEAR_DEFAULT_M;
+    let compression = solve_compression_k(min_height, max_height, h_linear, scale, available_y_range);
+    let scaled_range: f64 =
+        compressed_height(max_height, h_linear, scale, compression) - compressed_height(min_height, h_linear, scale, compression);
+    if compression <= 0.0 {
         eprintln!(
             "Realistic elevation: {:.1}m range fits in {} available blocks",
             height_range, available_y_range as i32
         );
-        ideal_scaled_range
     } else {
-        let compression_factor: f64 = available_y_range / height_range;
-        let compressed_range: f64 = height_range * compression_factor;
         eprintln!(
-            "Elevation compressed: {:.1}m range -> {:.0} blocks ({:.2}:1 ratio, 1 block = {:.2}m)",
+            "Elevation compressed above {:.0}m: {:.1}m range -> {:.0} blocks (k={:.6}, 1 block = {:.2}m average)",
+            h_linear,
             height_range,
-            compressed_range,
-            height_range / compressed_range,
-            compressed_range / height_range
+            scaled_range,
+            compression,
+            if scaled_range > 0.0 { height_range / scaled_range } else { 0.0 }
         );
-        compressed_range
-    };
+    }
 
     let mc_heights: Vec<Vec<f64>> = blurred_heights
         .par_iter()
         .map(|row| {
             row.iter()
                 .map(|&h| {
-                    let relative_height: f64 = if height_range > 0.0 {
-                        (h - min_height) / height_range
+                    let scaled_height: f64 = if height_range > 0.0 {
+                        compressed_height(h, h_linear, scale, compression)
+                            - compressed_height(min_height, h_linear, scale, compression)
                     } else {
                         0.0
                     };
-                    let scaled_height: f64 = relative_height * scaled_range;
                     let mc_y = ground_level as f64 + scaled_height;
                     mc_y.clamp(ground_level as f64, upper_clamp)
                 })
@@ -1860,7 +1962,17 @@ pub fn scale_to_minecraft(
             .round() as i32,
     );
 
-    (mc_heights, min_height, blocks_per_meter, ground_level)
+    let compression_info = ElevationCompressionInfo {
+        h_linear_m: h_linear,
+        compression,
+        // Degenerate grid (flat or all-NaN): `max_height` above is still the
+        // raw reduce result (possibly `f64::MIN` for all-NaN), never
+        // reconciled with `min_height` because `height_range == 0.0` short-
+        // circuits every use of it -- except this one, so it needs its own
+        // fallback to the same "everything is min_height" story.
+        max_source_elevation_m: if height_range > 0.0 { max_height } else { min_height },
+    };
+    (mc_heights, min_height, blocks_per_meter, ground_level, compression_info)
 }
 
 #[cfg(test)]
@@ -2149,7 +2261,7 @@ mod tests {
 
         // At scale 0.1 the relief needs 444 blocks, which already fits above -62.
         // The base must NOT sink: doing so would bury a shallow world in the basement.
-        let (_mc, _min_m, bpm, base) = scale_to_minecraft(&grid, 0.1, -62, -2030, true, 2031);
+        let (_mc, _min_m, bpm, base, _info) = scale_to_minecraft(&grid, 0.1, -62, -2030, true, 2031);
         assert_eq!(base, -62, "base must not sink when the relief already fits");
         assert!(
             (bpm - 0.1).abs() < 1e-9,
@@ -2158,7 +2270,7 @@ mod tests {
 
         // At scale 1.0 the relief needs 4441 blocks; only 2078 exist above -62, so the
         // base sinks to reach the datapack's lower half.
-        let (_mc, _min_m, bpm, base) = scale_to_minecraft(&grid, 1.0, -62, -2030, true, 2031);
+        let (_mc, _min_m, bpm, base, _info) = scale_to_minecraft(&grid, 1.0, -62, -2030, true, 2031);
         assert_eq!(
             base, -2030,
             "base must sink to the floor when the relief needs it"
@@ -2176,7 +2288,7 @@ mod tests {
         // disable_height_limit gate holds regardless: an explicit --ground-level is honoured
         // and the relief is compressed to fit, as before.
         let grid = swiss_grid();
-        let (_mc, _min_m, _bpm, base) = scale_to_minecraft(&grid, 1.0, 100, -62, false, 0);
+        let (_mc, _min_m, _bpm, base, _info) = scale_to_minecraft(&grid, 1.0, 100, -62, false, 0);
         assert_eq!(
             base, 100,
             "vanilla must not sink below an explicit ground level"
@@ -2187,7 +2299,7 @@ mod tests {
     fn without_the_extended_floor_the_alps_are_compressed() {
         // Vanilla: 319 - 15 + 62 = 366 blocks for 4441 m of relief.
         let grid = swiss_grid();
-        let (_mc, _min_m, bpm, base) = scale_to_minecraft(&grid, 1.0, -62, -62, false, 0);
+        let (_mc, _min_m, bpm, base, _info) = scale_to_minecraft(&grid, 1.0, -62, -62, false, 0);
         assert_eq!(base, -62);
         assert!(
             (bpm - 366.0 / 4441.0).abs() < 1e-6,
@@ -2196,11 +2308,88 @@ mod tests {
     }
 
     #[test]
+    fn h_linear_band_stays_at_exact_scale_when_compression_fires_above_it() {
+        // Bongnaesan-shaped relief: sea level (0m) up to ~395m, scale 1.75,
+        // vanilla ceiling (319-15=304) from ground_level -62 -> 366 available
+        // blocks. 395*1.75 = 691.25 does not fit 366, so compression fires --
+        // but only above H_LINEAR (120m); everything at or below it must
+        // still land at exactly the nominal scale, unaffected by whatever k
+        // gets solved for the part above.
+        let grid = vec![vec![0.0, 60.0, 120.0, 395.0]];
+        let (mc, _min_m, _bpm, base, info) = scale_to_minecraft(&grid, 1.75, -62, -62, false, 0);
+        assert_eq!(base, -62);
+        assert!(info.compression > 0.0, "691.25 blocks must not fit 366 uncompressed");
+        assert!((info.h_linear_m - H_LINEAR_DEFAULT_M).abs() < 1e-9);
+        assert!((info.max_source_elevation_m - 395.0).abs() < 1e-9);
+
+        // 0m and 60m (both <= H_LINEAR) map at exactly scale=1.75, regardless of k.
+        assert!((mc[0][0] - (-62.0)).abs() < 1e-6, "0m must sit at ground_level");
+        assert!(
+            (mc[0][1] - (-62.0 + 60.0 * 1.75)).abs() < 1e-6,
+            "60m must map at the full nominal scale, got {}",
+            mc[0][1]
+        );
+        assert!(
+            (mc[0][2] - (-62.0 + 120.0 * 1.75)).abs() < 1e-6,
+            "H_LINEAR itself must still be the linear-branch value, got {}",
+            mc[0][2]
+        );
+
+        // The compressed peak must land exactly on the ceiling (304), not overshoot it.
+        assert!(
+            (mc[0][3] - 304.0).abs() < 1e-6,
+            "max elevation must be calibrated to land exactly on the ceiling, got {}",
+            mc[0][3]
+        );
+
+        // Monotonic: strictly increasing block Y for strictly increasing elevation,
+        // even inside the compressed zone (never a flat or reversed step).
+        for w in mc[0].windows(2) {
+            assert!(w[1] > w[0], "compressed mapping must stay strictly increasing: {w:?}");
+        }
+    }
+
+    #[test]
+    fn compression_is_a_continuous_function_of_k_and_h() {
+        // Value AND slope must agree at the H_LINEAR seam, or the terrain
+        // would show a visible kink right where the compression starts.
+        let h_linear = 100.0;
+        let scale = 1.75;
+        let k = 0.01;
+        let eps = 1e-6;
+        let just_below = compressed_height(h_linear - eps, h_linear, scale, k);
+        let at = compressed_height(h_linear, h_linear, scale, k);
+        let just_above = compressed_height(h_linear + eps, h_linear, scale, k);
+        assert!((at - just_below).abs() < 1e-4, "value must be continuous at the seam");
+        assert!((just_above - at).abs() < 1e-4, "value must be continuous at the seam");
+        let slope_below = (at - just_below) / eps;
+        let slope_above = (just_above - at) / eps;
+        assert!(
+            (slope_below - scale).abs() < 1e-3,
+            "slope just below H_LINEAR must be the nominal scale"
+        );
+        assert!(
+            (slope_above - scale).abs() < 1e-3,
+            "slope must not jump at the seam (got {slope_above}, expected ~{scale})"
+        );
+    }
+
+    #[test]
+    fn k_zero_reproduces_the_pre_2_3_uniform_mapping() {
+        // compression == 0.0 (the manifest.json default/no-op value) must be
+        // pure `scale * h` everywhere, matching the behaviour before §2.3
+        // existed -- not just "close", bit-for-bit via the same formula.
+        for h in [0.0, 50.0, 120.0, 121.0, 500.0, -30.0] {
+            assert_eq!(compressed_height(h, 120.0, 1.75, 0.0), 1.75 * h);
+        }
+    }
+
+    #[test]
     fn scale_flat_terrain_keeps_real_min_height() {
         // Zero-relief terrain must still report its true elevation so the snow
         // line can tell a high plateau from a low one.
         let grid = vec![vec![4500.0_f64; 4]; 4];
-        let (mc, min_m, blocks_per_meter, _base) = scale_to_minecraft(&grid, 1.0, 64, 64, false, 0);
+        let (mc, min_m, blocks_per_meter, _base, _info) = scale_to_minecraft(&grid, 1.0, 64, 64, false, 0);
         assert_eq!(min_m, 4500.0);
         assert_eq!(blocks_per_meter, 0.0);
         // Every cell flattens to ground level.
@@ -2211,7 +2400,7 @@ mod tests {
     fn scale_all_nan_grid_min_height_zero() {
         // No finite samples must not leak the f64::MAX reduce sentinel as min.
         let grid = vec![vec![f64::NAN; 4]; 4];
-        let (_mc, min_m, blocks_per_meter, _base) =
+        let (_mc, min_m, blocks_per_meter, _base, _info) =
             scale_to_minecraft(&grid, 1.0, 64, 64, false, 0);
         assert_eq!(min_m, 0.0);
         assert_eq!(blocks_per_meter, 0.0);

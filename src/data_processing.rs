@@ -1403,6 +1403,56 @@ pub fn generate_world_with_options(
         );
     }
 
+    // SPEC_Build.md M1 / SPEC_Ingest.md §6 step 6 ("도로 배치"): after terrain
+    // (step 4) and before any future building/street-furniture stage (§6
+    // steps 7-9), on this *same* editor -- never a separately reopened one
+    // (see `kr_roads`'s module doc for why that corrupted terrain the first
+    // time this was tried). Only runs for `--input-source kr` with
+    // `--kr-roads-dir` given; omitting the flag keeps terrain-only behaviour.
+    if args.input_source == crate::args::InputSource::Kr {
+        if let Some(roads_dir) = &args.kr_roads_dir {
+            if eviction_active {
+                // This pass reads terrain heights from `Ground` (never evicted) but
+                // *writes* blocks straight into `editor`, which a large/eviction run
+                // has already been streaming resident regions out of since partway
+                // through the tile loop above -- writes there would light up fresh,
+                // empty regions instead of landing on the terrain that used to be
+                // resident. Not handled yet (this run is small enough that eviction
+                // never activates); skip with a clear message rather than silently
+                // placing roads with holes in them.
+                eprintln!(
+                    "Warning: KR roads generation skipped -- this world streamed regions to disk \
+                     (eviction_active), which this pass does not yet support."
+                );
+            } else {
+                let planar = args
+                    .korea_planar_bbox
+                    .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
+                let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
+                match crate::kr_roads::generate_kr_roads(
+                    &mut editor,
+                    ground.as_ref(),
+                    &xzbbox,
+                    &planar,
+                    args.scale,
+                    roads_dir,
+                    &graph_output_dir,
+                ) {
+                    Ok(report) => println!(
+                        "KR roads: {} nodes, {} segments placed ({} links skipped for a missing node); \
+                         slope violations: {}, node height mismatches: {}",
+                        report.nodes_placed,
+                        report.segments_placed,
+                        report.links_skipped_missing_node,
+                        report.slope_violations,
+                        report.node_height_mismatches
+                    ),
+                    Err(e) => eprintln!("Warning: KR roads generation failed: {e}"),
+                }
+            }
+        }
+    }
+
     // Free everything the save phase doesn't need; it often sits at the process peak.
     // The editor holds its own handle on the sealed-surface mask, and that mask is the
     // road mask itself when nothing else was sealed, so releasing it here is what

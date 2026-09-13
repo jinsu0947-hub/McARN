@@ -11,7 +11,7 @@ use crate::{
 };
 use postprocess::{
     apply_land_cover_repair, fill_nan_values, filter_elevation_outliers, repair_terrain_anomalies,
-    scale_to_minecraft,
+    scale_to_minecraft, ElevationCompressionInfo,
 };
 use provider::{ElevationProvider, RawElevationGrid};
 use selector::select_provider;
@@ -48,6 +48,11 @@ pub struct ElevationData {
     /// Terrain base actually used: the requested ground level, or lower if the relief
     /// needed the extended floor. Every consumer of the affine must use this, not args.
     pub(crate) ground_level: i32,
+    /// SPEC_Ingest.md §2.3: the `H_LINEAR`/`compression`/max-source-elevation
+    /// `scale_to_minecraft` solved for this run, so `manifest.json`'s
+    /// `elevation_mapping` can be built from the real values instead of the
+    /// CLI's nominal `scale`.
+    pub(crate) elevation_mapping: ElevationCompressionInfo,
 }
 
 /// Maximum elevation grid dimension requested from providers per axis.
@@ -220,14 +225,15 @@ pub fn fetch_elevation_data(
     bench.mark("elev_landcover_repair");
     emit_gui_progress_update(16.0, "Processing elevation...");
 
-    let (mc_heights, min_height_m, blocks_per_meter, effective_ground_level) = scale_to_minecraft(
-        &height_grid,
-        scale,
-        ground_level,
-        min_ground_level,
-        disable_height_limit,
-        extended_max_y,
-    );
+    let (mc_heights, min_height_m, blocks_per_meter, effective_ground_level, elevation_mapping) =
+        scale_to_minecraft(
+            &height_grid,
+            scale,
+            ground_level,
+            min_ground_level,
+            disable_height_limit,
+            extended_max_y,
+        );
     bench.mark("elev_scale_to_mc");
 
     // Log min/max block heights
@@ -267,6 +273,7 @@ pub fn fetch_elevation_data(
             1.0
         },
         ground_level: effective_ground_level,
+        elevation_mapping,
     })
 }
 

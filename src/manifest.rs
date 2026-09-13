@@ -26,9 +26,29 @@ pub struct ManifestOrigin {
     pub y2_base: i32,
 }
 
+/// SPEC_Ingest.md §2.3 "고도 압축 매핑": the parameters needed to invert a
+/// block Y back to a real-world elevation once compression fired. Paired
+/// with `origin.h0` (the bottom of the mapping) the same way `origin` itself
+/// is paired with `bbox` -- neither reads on its own without the other.
+/// `None` when elevation was disabled (nothing was mapped, let alone
+/// compressed).
+#[derive(Serialize)]
+pub struct ManifestElevationMapping {
+    /// `H_LINEAR` (m): elevation up to which `scale` applied in full.
+    pub h_linear: f64,
+    /// Solved compression coefficient `k`. `0.0` means the relief fit the
+    /// available Y-range at full `scale` and no compression ran.
+    pub compression: f64,
+    /// The raw grid's maximum elevation (m) -- what `compression` was solved
+    /// against.
+    pub max_source_elevation: f64,
+}
+
 pub struct Manifest {
     pub scale: f64,
     pub origin: ManifestOrigin,
+    /// SPEC_Ingest.md §2.3. `None` when elevation was disabled.
+    pub elevation_mapping: Option<ManifestElevationMapping>,
     /// Block-coordinate extents `[x_min, z_min, x_max, z_max]` (SPEC_Build.md §3.1).
     pub bbox: [i32; 4],
     /// Data sources actually used this run, not a fixed template -- M0 only
@@ -45,6 +65,7 @@ struct ManifestDocument<'a> {
     generated_at: String,
     scale: f64,
     origin: &'a ManifestOrigin,
+    elevation_mapping: &'a Option<ManifestElevationMapping>,
     bbox: [i32; 4],
     sources: &'a [serde_json::Value],
     parameters: serde_json::Value,
@@ -59,6 +80,7 @@ impl Manifest {
             generated_at: now_iso8601_utc(),
             scale: self.scale,
             origin: &self.origin,
+            elevation_mapping: &self.elevation_mapping,
             bbox: self.bbox,
             sources: &self.sources,
             parameters: serde_json::json!({}),
