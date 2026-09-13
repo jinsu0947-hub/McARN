@@ -78,6 +78,7 @@ P2~P6에서 계산된 도로망 구조를 후속 단계가 재사용할 수 있�
           "pos": [x, z],
           "y2": 128,
           "road_half_width": [3, 3],
+          "curb_width": [1, 1],
           "sidewalk_width": [2, 0],
           "structure": "ground"
         }
@@ -91,7 +92,8 @@ P2~P6에서 계산된 도로망 구조를 후속 단계가 재사용할 수 있�
 ```
 
 - `y2`: §1.1 반블록 단위 정수 높이 (확정값)
-- `road_half_width`: 중심선 기준 [좌, 우] 차도 폭
+- `road_half_width`: 중심선 기준 [좌, 우] 차도 폭 (연석 제외, SPEC_RoadSection.md §2)
+- `curb_width`: [좌, 우] 연석 폭. SPEC_RoadSection.md §2 기준 등급별 1(F등급만 0) -- 이 열이 명시적으로 있어야 도로 위 가로 요소(전주·표지, 후속 명세)가 차도/인도와 같은 좌표계에서 자기 자리를 찾는다
 - `sidewalk_width`: [좌, 우] 인도 폭. 0이면 인도 없음
 - `structure`: `ground` / `elevated` / `tunnel`
 - `excluded`: 처리에서 제외된 영역. 후속 단계도 동일하게 건너뛴다
