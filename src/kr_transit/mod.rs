@@ -344,7 +344,7 @@ pub const STUB_LENGTH_M: f64 = 50.0;
 /// extent didn't reach the connecting road) is skipped with a warning, not
 /// treated as fatal -- SPEC_GenerationScope §1.3 already calls this
 /// polyline "대략적 정확도로 충분" for its one purpose (buffer extent).
-fn build_route_polylines(
+pub(crate) fn build_route_polylines(
     doc: &mut StopsDocument,
     moct_dir: &Path,
     planar: &KoreaPlanarBBox,

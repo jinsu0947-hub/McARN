@@ -6,6 +6,12 @@
 //! network to fetch one), so this is hand-rolled against the public ESRI
 //! Shapefile Technical Description and the dBASE III+ file format -- both
 //! simple, stable, well-documented binary formats.
+//!
+//! Also carries `kr_buildings`' polygon + huge-table reading
+//! ([`read_polygons_filtered`], [`DbfIndexedTable`]) -- 건물통합정보 is the
+//! same two formats, just a different shape type and, at ~857 MB for a
+//! province-wide `.dbf`, too big to load whole the way every other table
+//! here does.
 
 use std::fs;
 use std::io;
@@ -166,6 +172,7 @@ fn decode_cp949_lossy(bytes: &[u8]) -> String {
 /// Shape type codes this module understands (ESRI Shapefile spec).
 const SHAPE_TYPE_POINT: i32 = 1;
 const SHAPE_TYPE_POLYLINE: i32 = 3;
+const SHAPE_TYPE_POLYGON: i32 = 5;
 
 /// Reads a point shapefile (NODE.shp) into `(x, y)` pairs in file order --
 /// index-aligned with the paired `.dbf`'s records, same convention `.shp`/
@@ -245,6 +252,201 @@ pub fn read_polylines(path: &Path) -> io::Result<Vec<Vec<(f64, f64)>>> {
         pos = content_start + content_len_bytes;
     }
     Ok(lines)
+}
+
+/// Reads a polygon shapefile (건물통합정보's footprints), keeping only the
+/// records whose own bounding box (stored per-record right after the shape
+/// type, before any point data) intersects `bbox_en` -- Busan-wide building
+/// data is ~470k records but a single run's bbox needs a few thousand, and
+/// skipping point-array parsing for the rest is the difference between this
+/// being instant and building nearly half a million short-lived `Vec`s. Each
+/// kept record's rings are split by its own `parts` offsets (unlike
+/// [`read_polylines`]'s deliberate flattening -- a polygon's holes and outer
+/// ring must not be concatenated into one line). Returned in file order, each
+/// tagged with its 0-based record index so the caller can join back to the
+/// paired `.dbf` by position.
+pub fn read_polygons_filtered(
+    path: &Path,
+    bbox_en: (f64, f64, f64, f64),
+) -> io::Result<Vec<(usize, Vec<Vec<(f64, f64)>>)>> {
+    let data = fs::read(path)?;
+    let shape_type = i32::from_le_bytes([data[32], data[33], data[34], data[35]]);
+    if shape_type != SHAPE_TYPE_POLYGON {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected Polygon (5), got shape type {shape_type}"),
+        ));
+    }
+    let (e_min, n_min, e_max, n_max) = bbox_en;
+    let mut out = Vec::new();
+    let mut pos = 100;
+    let mut record_index = 0usize;
+    while pos + 8 <= data.len() {
+        let content_len_words = u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]]);
+        let content_start = pos + 8;
+        let content_len_bytes = content_len_words as usize * 2;
+        if content_start + content_len_bytes > data.len() || content_len_bytes < 44 {
+            break;
+        }
+        // A null shape (numParts/numPoints both absent) has content_len_bytes
+        // == 4 (just the shape-type word) and would underflow the box read.
+        if content_len_bytes >= 36 {
+            let box_xmin = f64::from_le_bytes(data[content_start + 4..content_start + 12].try_into().unwrap());
+            let box_ymin = f64::from_le_bytes(data[content_start + 12..content_start + 20].try_into().unwrap());
+            let box_xmax = f64::from_le_bytes(data[content_start + 20..content_start + 28].try_into().unwrap());
+            let box_ymax = f64::from_le_bytes(data[content_start + 28..content_start + 36].try_into().unwrap());
+            let intersects = box_xmin <= e_max && box_xmax >= e_min && box_ymin <= n_max && box_ymax >= n_min;
+            if intersects {
+                let num_parts = i32::from_le_bytes(
+                    data[content_start + 36..content_start + 40].try_into().unwrap(),
+                ) as usize;
+                let num_points = i32::from_le_bytes(
+                    data[content_start + 40..content_start + 44].try_into().unwrap(),
+                ) as usize;
+                let parts_start = content_start + 44;
+                let points_start = parts_start + num_parts * 4;
+                let mut part_offsets = Vec::with_capacity(num_parts + 1);
+                for i in 0..num_parts {
+                    let p = parts_start + i * 4;
+                    if p + 4 > data.len() {
+                        break;
+                    }
+                    part_offsets.push(i32::from_le_bytes(data[p..p + 4].try_into().unwrap()) as usize);
+                }
+                part_offsets.push(num_points);
+                let mut all_points = Vec::with_capacity(num_points);
+                for i in 0..num_points {
+                    let p = points_start + i * 16;
+                    if p + 16 > data.len() {
+                        break;
+                    }
+                    let x = f64::from_le_bytes(data[p..p + 8].try_into().unwrap());
+                    let y = f64::from_le_bytes(data[p + 8..p + 16].try_into().unwrap());
+                    all_points.push((x, y));
+                }
+                let mut rings = Vec::with_capacity(num_parts.max(1));
+                for w in part_offsets.windows(2) {
+                    let (start, end) = (w[0], w[1]);
+                    if start <= end && end <= all_points.len() {
+                        rings.push(all_points[start..end].to_vec());
+                    }
+                }
+                if !rings.is_empty() {
+                    out.push((record_index, rings));
+                }
+            }
+        }
+        pos = content_start + content_len_bytes;
+        record_index += 1;
+    }
+    Ok(out)
+}
+
+/// A `.dbf` too large to load whole (건물통합정보's Busan-wide distribution is
+/// 857 MB single-file) -- reads only the header and field descriptors up
+/// front, then seeks and reads one fixed-length record at a time on demand.
+/// Everything else about the format (record layout, deletion-flag byte,
+/// codepage detection) matches [`DbfTable`] exactly; this exists purely for
+/// the memory difference, not a format difference.
+pub struct DbfIndexedTable {
+    fields: Vec<DbfField>,
+    record_len: usize,
+    header_len: usize,
+    num_records: usize,
+    encoding: TextEncoding,
+    file: fs::File,
+}
+
+/// One record read back from a [`DbfIndexedTable`], kept only long enough to
+/// pull however many fields the caller needs out of it -- avoids a re-seek
+/// per field the way repeated `DbfIndexedTable::get` calls would.
+pub struct DbfRow {
+    bytes: Vec<u8>,
+}
+
+impl DbfIndexedTable {
+    pub fn open(path: &Path) -> io::Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = fs::File::open(path)?;
+        let mut header = [0u8; 32];
+        file.read_exact(&mut header)?;
+        let num_records = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
+        let header_len = u16::from_le_bytes([header[8], header[9]]) as usize;
+        let record_len = u16::from_le_bytes([header[10], header[11]]) as usize;
+
+        let field_block_len = header_len.saturating_sub(33);
+        let mut field_block = vec![0u8; field_block_len];
+        file.seek(SeekFrom::Start(32))?;
+        file.read_exact(&mut field_block)?;
+
+        let mut fields = Vec::new();
+        let mut offset = 1;
+        let mut pos = 0;
+        while pos + 32 <= field_block.len() && field_block[pos] != 0x0D {
+            let raw_name = &field_block[pos..pos + 11];
+            let name_len = raw_name.iter().position(|&b| b == 0).unwrap_or(11);
+            let name = String::from_utf8_lossy(&raw_name[..name_len]).trim().to_string();
+            let len = field_block[pos + 16] as usize;
+            fields.push(DbfField { name, offset, len });
+            offset += len;
+            pos += 32;
+        }
+
+        Ok(Self { fields, record_len, header_len, num_records, encoding: detect_encoding(path), file })
+    }
+
+    pub fn len(&self) -> usize {
+        self.num_records
+    }
+
+    pub fn field_names(&self) -> Vec<&str> {
+        self.fields.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    /// Reads one record (deletion flag + every field's raw bytes) directly
+    /// from disk by seeking to its offset -- O(1) regardless of table size.
+    pub fn read_row(&mut self, record_index: usize) -> io::Result<DbfRow> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut bytes = vec![0u8; self.record_len];
+        self.file.seek(SeekFrom::Start((self.header_len + record_index * self.record_len) as u64))?;
+        self.file.read_exact(&mut bytes)?;
+        Ok(DbfRow { bytes })
+    }
+}
+
+impl DbfRow {
+    pub fn is_deleted(&self) -> bool {
+        self.bytes.first().copied() == Some(0x2A)
+    }
+
+    /// Same field-by-name slicing and codepage decoding as [`DbfTable::get`],
+    /// against this one already-read record's bytes.
+    pub fn get(&self, table: &DbfIndexedTable, field_name: &str) -> String {
+        match self.get_raw(table, field_name) {
+            Some(raw) => match table.encoding {
+                TextEncoding::Utf8 => String::from_utf8_lossy(raw).trim().to_string(),
+                TextEncoding::AsciiLossy => decode_cp949_lossy(raw).trim().to_string(),
+            },
+            None => String::new(),
+        }
+    }
+
+    /// The field's raw fixed-width bytes, undecoded -- for a caller that
+    /// needs real CP949/EUC-KR text (not [`TextEncoding::AsciiLossy`]'s
+    /// display-only `?`-substitution) and has its own decoder, such as
+    /// `kr_buildings` reading 건물통합정보's 주용도/구조 text via
+    /// `encoding_rs::EUC_KR` (no `.cpg` sidecar ships with that distribution,
+    /// so [`detect_encoding`] can't tell this table is Korean text on its
+    /// own).
+    pub fn get_raw<'a>(&'a self, table: &DbfIndexedTable, field_name: &str) -> Option<&'a [u8]> {
+        let field = table.fields.iter().find(|f| f.name == field_name)?;
+        let start = field.offset;
+        let end = start + field.len;
+        if end > self.bytes.len() {
+            return None;
+        }
+        Some(&self.bytes[start..end])
+    }
 }
 
 /// Reconciles a `.dbf`'s row count against the paired `.shp`'s geometry

@@ -957,6 +957,76 @@ pub fn generate_world_with_options(
         None
     };
 
+    // SPEC_Build.md M4 "건물": solved once, here, after M1's road network --
+    // see `kr_buildings`' module doc. Needs `--kr-buildings-shp` and
+    // `--kr-roads-dir` (footprints are clipped against M1's already-solved
+    // segments); omitting either keeps M0-M3 behaviour unchanged (no
+    // `buildings.json`, no building blocks).
+    let kr_buildings: Option<Arc<Vec<crate::kr_buildings::PlannedBuilding>>> =
+        if args.input_source == crate::args::InputSource::Kr {
+            if let (Some(shp_path), Some(network)) = (&args.kr_buildings_shp, &kr_road_network) {
+                let planar = args
+                    .korea_planar_bbox
+                    .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
+                let dbf_path = shp_path.with_extension("dbf");
+                // L2/L3 (SPEC_GenerationScope.md §2) keys off the bus-route
+                // centerlines M2 already builds for the terrain buffer --
+                // recomputed here rather than threaded out of `build_m2`
+                // (small, and keeps that function's own signature/callers
+                // untouched). `None` when M2 wasn't run this invocation, in
+                // which case `kr_buildings` itself treats every building as
+                // L2 -- see that module's doc for why that's the right
+                // fallback, not a silent bug.
+                let route_polylines = if let (Some(bus_stops_dir), Some(bus_routes_csv)) =
+                    (&args.kr_bus_stops_dir, &args.kr_bus_routes_csv)
+                {
+                    crate::kr_transit::build_stops_document(bus_stops_dir, bus_routes_csv, &planar, args.scale)
+                        .ok()
+                        .and_then(|(mut doc, _)| {
+                            let roads_dir = args.kr_roads_dir.as_ref()?;
+                            crate::kr_transit::build_route_polylines(&mut doc, roads_dir, &planar, args.scale).ok()
+                        })
+                } else {
+                    None
+                };
+                match crate::kr_buildings::compute_kr_buildings(
+                    ground.as_ref(),
+                    &xzbbox,
+                    &planar,
+                    args.scale,
+                    shp_path,
+                    &dbf_path,
+                    network,
+                    route_polylines.as_ref(),
+                ) {
+                    Ok((buildings, report)) => {
+                        println!(
+                            "KR buildings: {} loaded, {} placed, {} omitted (road overlap <30%), \
+                             {} clipped (road overlap), {} simplified to L3",
+                            report.loaded,
+                            report.placed,
+                            report.omitted_road_overlap,
+                            report.clipped_road_overlap,
+                            report.l3_simplified
+                        );
+                        let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
+                        if let Err(e) = crate::kr_buildings::write_buildings_json(&graph_output_dir, &buildings) {
+                            eprintln!("Warning: KR buildings: failed to write buildings.json: {e}");
+                        }
+                        Some(Arc::new(buildings))
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: KR buildings (M4) failed: {e}");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
     // Decide between sequential and parallel processing based on world size.
     // Tile subdivision is aligned to 512-block Minecraft region boundaries.
     let tiles = tile::create_tiles(&xzbbox, tile::DEFAULT_TILE_SIZE);
@@ -1247,6 +1317,20 @@ pub fn generate_world_with_options(
                         crate::kr_roads::place_segments(&mut tile_editor, matching);
                     }
 
+                    // SPEC_Build.md M4 step ("건물 생성"): same eviction-safe
+                    // per-tile placement as roads just above -- see
+                    // `kr_buildings`' module doc.
+                    if let Some(buildings) = &kr_buildings {
+                        let matching = buildings.iter().filter(|b| {
+                            let (min_x, max_x, min_z, max_z) = b.aabb();
+                            min_x < tile_bounds.max_x
+                                && max_x >= tile_bounds.min_x
+                                && min_z < tile_bounds.max_z
+                                && max_z >= tile_bounds.min_z
+                        });
+                        crate::kr_buildings::place_buildings(&mut tile_editor, matching);
+                    }
+
                     let tile_road_overrides = tile_editor.take_road_surface_overrides();
 
                     // Emit on whole-percent steps only; the monotonic clamp
@@ -1532,6 +1616,9 @@ pub fn generate_world_with_options(
     if !use_parallel_tiles {
         if let Some(network) = &kr_road_network {
             crate::kr_roads::place_segments(&mut editor, &network.segments);
+        }
+        if let Some(buildings) = &kr_buildings {
+            crate::kr_buildings::place_buildings(&mut editor, buildings.iter());
         }
     }
 

@@ -101,6 +101,19 @@ pub struct Args {
     #[arg(long = "kr-bus-routes-csv")]
     pub kr_bus_routes_csv: Option<std::path::PathBuf>,
 
+    /// SPEC_Build.md M4: path to 건물통합정보's `.shp` (its `.dbf` sibling is
+    /// read from the same path with the extension swapped). Unlike
+    /// `--kr-roads-dir`, this points at the file directly rather than a
+    /// fixed-name directory -- Busan's distribution ships as a single dated
+    /// filename (`AL_D010_26_20260909.shp`), not MOCT's stable
+    /// `MOCT_LINK`/`MOCT_NODE` pair, so there is no fixed basename to look
+    /// for inside a directory. Needs `--kr-roads-dir` too (the road network
+    /// it clips footprints against). Only read for `--input-source kr`;
+    /// omitting it keeps M0-M3 behaviour unchanged (no `buildings.json`, no
+    /// building blocks placed).
+    #[arg(long = "kr-buildings-shp")]
+    pub kr_buildings_shp: Option<std::path::PathBuf>,
+
     /// Directory for the terrain computation cache (`terrain_cache` module):
     /// `Ground::new_enabled`'s fetched-and-repaired elevation/land-cover/
     /// canopy grids, keyed by every input that affects them (bbox, scale,

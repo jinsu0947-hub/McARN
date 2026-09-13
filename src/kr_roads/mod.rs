@@ -262,6 +262,26 @@ pub struct ProfilePoint {
     y2: i32,
 }
 
+impl ProfilePoint {
+    pub(crate) fn xz(&self) -> (i32, i32) {
+        (self.x, self.z)
+    }
+    /// Half-block unit -- callers wanting a whole-block Y should
+    /// `div_euclid(2)` this themselves; kept raw here since some callers
+    /// (SPEC_BuildingType.md §10's front-road-height reference) want to know
+    /// whether the road sits on a half-block slab, not just its floor.
+    pub(crate) fn y2(&self) -> i32 {
+        self.y2
+    }
+}
+
+/// `kr_buildings`' road-occupancy clip (SPEC_Ingest.md §4.2 step 2): the same
+/// per-grade total paved width `sweep_and_place` already sweeps, exposed for
+/// a caller outside this module.
+pub(crate) fn road_total_width(class: RoadClass) -> i32 {
+    section_spec(class).total_width()
+}
+
 pub struct Segment {
     id: String,
     link_id: String,
@@ -283,6 +303,21 @@ pub struct Segment {
 }
 
 impl Segment {
+    /// `kr_buildings`' own read side (SPEC_Ingest.md §4.2 / SPEC_RoadSection.md
+    /// §5: road-occupancy clipping needs each nearby segment's centerline and
+    /// grade, not just its `aabb`). `kr_buildings` is a sibling module, not a
+    /// child of this one, so these fields need an explicit accessor the way
+    /// `bridges`/`routing` (both children) don't.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+    pub(crate) fn class(&self) -> RoadClass {
+        self.class
+    }
+    pub(crate) fn points(&self) -> &[ProfilePoint] {
+        &self.points
+    }
+
     /// `(min_x, max_x, min_z, max_z)` over this segment's centerline points,
     /// padded by its own grade's full cross-section width -- generous enough
     /// that any tile whose (halo-expanded) bounds this overlaps is guaranteed

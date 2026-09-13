@@ -1685,6 +1685,7 @@ fn gui_start_generation(
                 kr_roads_dir: None,
                 kr_bus_stops_dir: None,
                 kr_bus_routes_csv: None,
+                kr_buildings_shp: None,
                 terrain_cache_dir: None,
                 // A CLI aid only: `--mapillary-facades-dir` builds from a
                 // prepared export instead of fetching one, which is how the
