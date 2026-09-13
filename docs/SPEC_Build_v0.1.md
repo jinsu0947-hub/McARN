@@ -129,6 +129,7 @@ buildings.json
   "generated_at": "...",
   "scale": 1.75,
   "origin": { "epsg": 5186, "e0": 0, "n0": 0, "h0": 0, "y2_base": -88 },
+  "elevation_mapping": { "h_linear": 120, "compression": 0.0, "max_source_elevation": 0.0 },
   "bbox": [x_min, z_min, x_max, z_max],
   "sources": [
     { "name": "표준노드링크", "version": "...", "retrieved": "..." },
