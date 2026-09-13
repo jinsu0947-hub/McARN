@@ -382,6 +382,57 @@ impl Ground {
         self.canopy.is_some()
     }
 
+    /// `terrain_cache`'s own read side -- see that module's doc. Not useful
+    /// outside a cache writer: every real query goes through `Ground`'s own
+    /// higher-level methods (`level`, `canopy_height_m`, ...).
+    pub(crate) fn elevation_data(&self) -> Option<&ElevationData> {
+        self.elevation_data.as_ref()
+    }
+    pub(crate) fn land_cover_data(&self) -> Option<&LandCoverData> {
+        self.land_cover.as_ref()
+    }
+    pub(crate) fn canopy_data(&self) -> Option<&CanopyData> {
+        self.canopy.as_ref()
+    }
+    pub(crate) fn extended_ceiling(&self) -> bool {
+        self.extended_ceiling
+    }
+
+    /// `terrain_cache`'s own write side: rebuilds a `Ground` from a cache
+    /// hit's deserialized grids, without going through `new_enabled`'s own
+    /// fetch/repair pipeline. `rotation_mask` is always `None` here, the
+    /// same as every fresh `new_enabled` result -- it's set later by a
+    /// separate call, never part of the cached computation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_cache_parts(
+        elevation_enabled: bool,
+        extended_ceiling: bool,
+        ground_level: i32,
+        elevation_data: Option<ElevationData>,
+        land_cover: Option<LandCoverData>,
+        canopy: Option<CanopyData>,
+        world_width: usize,
+        world_height: usize,
+        snow_threshold_y: i32,
+        climate: crate::climate::Climate,
+        body: CelestialBody,
+    ) -> Self {
+        Self {
+            elevation_enabled,
+            extended_ceiling,
+            ground_level,
+            elevation_data,
+            land_cover,
+            canopy,
+            world_width,
+            world_height,
+            rotation_mask: None,
+            snow_threshold_y,
+            climate,
+            body,
+        }
+    }
+
     /// Canopy top in metres, or `None` where the map has no measurement.
     /// A measured zero is bare ground, not missing.
     #[inline(always)]
@@ -1024,18 +1075,58 @@ pub fn generate_ground_data(args: &Args, bbox: LLBBox) -> Ground {
     crate::world_editor::common::set_terrain_top_y(args.ground_level);
     if args.terrain() {
         println!("{} Fetching elevation...", "[3/7]".bold());
-        let ground = Ground::new_enabled(
-            &bbox,
-            args.scale,
-            args.ground_level,
-            min_ground_level_for(args),
-            args.disable_height_limit,
-            extended_max_y_for(args),
-            args.aws_only_elevation,
-            args.benchmark,
-            args.canopy_height,
-            args.body,
-        );
+        let cache_key = args.terrain_cache_dir.as_ref().map(|_| crate::terrain_cache::CacheKey {
+            bbox,
+            scale: args.scale,
+            ground_level: args.ground_level,
+            min_ground_level: min_ground_level_for(args),
+            disable_height_limit: args.disable_height_limit,
+            extended_max_y: extended_max_y_for(args),
+            aws_only_elevation: args.aws_only_elevation,
+            canopy_height: args.canopy_height,
+            body: args.body,
+        });
+        let cached = match (&args.terrain_cache_dir, &cache_key) {
+            (Some(dir), Some(key)) => match crate::terrain_cache::load(dir, key) {
+                Ok(Some(ground)) => {
+                    println!("[TERRAIN CACHE] hit: reusing cached terrain from {}", dir.display());
+                    Some(ground)
+                }
+                Ok(None) => {
+                    println!("[TERRAIN CACHE] miss: no matching cache entry in {}", dir.display());
+                    None
+                }
+                Err(e) => {
+                    println!("[TERRAIN CACHE] miss: failed to read cache ({e})");
+                    None
+                }
+            },
+            _ => None,
+        };
+        let ground = match cached {
+            Some(ground) => ground,
+            None => {
+                let ground = Ground::new_enabled(
+                    &bbox,
+                    args.scale,
+                    args.ground_level,
+                    min_ground_level_for(args),
+                    args.disable_height_limit,
+                    extended_max_y_for(args),
+                    args.aws_only_elevation,
+                    args.benchmark,
+                    args.canopy_height,
+                    args.body,
+                );
+                if let (Some(dir), Some(key)) = (&args.terrain_cache_dir, &cache_key) {
+                    match crate::terrain_cache::store(dir, key, &ground) {
+                        Ok(()) => println!("[TERRAIN CACHE] stored computed terrain in {}", dir.display()),
+                        Err(e) => println!("[TERRAIN CACHE] failed to store cache: {e}"),
+                    }
+                }
+                ground
+            }
+        };
         // The scaler may have sunk the base to reach the extended floor. The bedrock plane and
         // the out-of-bbox filler chunks both key off that base, so pin them to it now.
         crate::world_editor::set_base_chunk_y(ground.base_level());

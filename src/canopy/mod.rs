@@ -58,6 +58,11 @@ impl CanopyData {
         }
     }
 
+    /// `terrain_cache`'s own read side -- see that module's doc.
+    pub(crate) fn grid(&self) -> &[u8] {
+        &self.grid
+    }
+
     #[inline(always)]
     pub fn at(&self, gx: usize, gz: usize) -> u8 {
         if gx >= self.width || gz >= self.height {

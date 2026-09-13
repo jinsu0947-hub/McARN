@@ -101,6 +101,20 @@ pub struct Args {
     #[arg(long = "kr-bus-routes-csv")]
     pub kr_bus_routes_csv: Option<std::path::PathBuf>,
 
+    /// Directory for the terrain computation cache (`terrain_cache` module):
+    /// `Ground::new_enabled`'s fetched-and-repaired elevation/land-cover/
+    /// canopy grids, keyed by every input that affects them (bbox, scale,
+    /// ground level, height-limit settings, celestial body, ...). A repeat
+    /// run with an identical key loads the cached grids instead of
+    /// re-fetching and re-repairing them -- the dominant cost of a large
+    /// run (measured: ~60% of total time on a real 7x4km run went into
+    /// land-cover repair alone). Opt-in: omitting this flag leaves every
+    /// existing run's behaviour unchanged. Never a `WorldEditor`/world
+    /// directory -- see that module's own doc for why a cache built from
+    /// reopening a saved *world* is exactly what this must not be.
+    #[arg(long = "terrain-cache-dir")]
+    pub terrain_cache_dir: Option<std::path::PathBuf>,
+
     /// Resolved once, by `apply_input_source_defaults`, from `--bbox-en` or
     /// by converting `--bbox` -- SPEC_Ingest.md §2.1's "read once and
     /// convert" applied to extent, not just per-point CRS lookup: every call

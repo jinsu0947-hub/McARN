@@ -50,6 +50,7 @@ mod progress;
 mod projection;
 mod retrieve_data;
 mod structures;
+mod terrain_cache;
 #[cfg(feature = "gui")]
 mod telemetry;
 #[cfg(test)]

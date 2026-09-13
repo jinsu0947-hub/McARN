@@ -88,3 +88,9 @@ gen/
 # repo's own tooling writes into it (stops_review.json, ...) -- ~800 MB,
 # never meant to be committed.
 /data/
+
+# --terrain-cache-dir's default location: computed elevation/land-cover/
+# canopy grids (src/terrain_cache.rs), not source data and not a world --
+# same treatment as /data/ above, for the same reason (large, regenerable,
+# never meant to be committed).
+/terrain_cache/

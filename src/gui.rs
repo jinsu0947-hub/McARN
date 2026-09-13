@@ -1680,6 +1680,12 @@ fn gui_start_generation(
                 mapillary_token: Some(mapillary_token.trim().to_string()).filter(|t| !t.is_empty()),
                 mapillary_probe: false,
                 mapillary_debug_dir: None,
+                // The GUI has no Korean-source picker yet (see the
+                // `input_source` comment above) and no terrain-cache toggle.
+                kr_roads_dir: None,
+                kr_bus_stops_dir: None,
+                kr_bus_routes_csv: None,
+                terrain_cache_dir: None,
                 // A CLI aid only: `--mapillary-facades-dir` builds from a
                 // prepared export instead of fetching one, which is how the
                 // Python lab's output is reviewed. The GUI fetches into the
