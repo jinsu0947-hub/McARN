@@ -28,6 +28,7 @@ mod kr_bus_routes;
 mod kr_bus_stops;
 mod kr_buildings;
 mod kr_roads;
+mod kr_street_furniture;
 mod kr_transit;
 mod land_cover;
 mod landmarks;

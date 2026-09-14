@@ -371,6 +371,18 @@ impl PlannedBuilding {
         // this building could still draw just outside its own footprint.
         (min_x - 3, max_x + 3, min_z - 3, max_z + 3)
     }
+
+    /// SPEC_StreetFurniture.md §2.3 (인입선): needs footprint cells (nearest-
+    /// pole-distance check), roof Y (where the service drop attaches),
+    /// use-group (only C/R get one), and enough identity for the hash that
+    /// decides the 50% draw -- exposed together so that module doesn't need
+    /// its own copy of this struct's private layout.
+    pub fn service_drop_info(&self) -> Option<(&[(i32, i32)], i32, UseGroup, &str)> {
+        if self.omitted {
+            return None;
+        }
+        Some((&self.cells, self.ground_y + self.total_height, self.group, &self.id))
+    }
 }
 
 pub struct KrBuildingsReport {

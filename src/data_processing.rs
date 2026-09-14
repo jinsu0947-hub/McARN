@@ -1397,6 +1397,25 @@ pub fn generate_world_with_options(
                         crate::kr_buildings::place_buildings(&mut tile_editor, matching);
                     }
 
+                    // SPEC_Build.md M5 step ("가로 요소"), §2 전주·전선 first
+                    // per SPEC_StreetFurniture.md §0's own priority -- same
+                    // per-tile/eviction-safe placement as roads/buildings
+                    // above. A fresh claim registry per tile, since this
+                    // tile's own editor is what §8 priority is being
+                    // resolved against; bus stops (once implemented) will
+                    // claim into the same map before this call runs.
+                    if kr_road_network.is_some() {
+                        let mut claimed_columns = crate::kr_street_furniture::ClaimedColumns::default();
+                        let building_slice: &[crate::kr_buildings::PlannedBuilding] =
+                            kr_buildings.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+                        crate::kr_street_furniture::place_utility_lines(
+                            &mut tile_editor,
+                            kr_matching_segments.iter().copied(),
+                            building_slice,
+                            &mut claimed_columns,
+                        );
+                    }
+
                     let tile_road_overrides = tile_editor.take_road_surface_overrides();
 
                     // Emit on whole-percent steps only; the monotonic clamp
@@ -1714,6 +1733,19 @@ pub fn generate_world_with_options(
         }
         if let Some(buildings) = &kr_buildings {
             crate::kr_buildings::place_buildings(&mut editor, buildings.iter());
+        }
+        // SPEC_Build.md M5, §2 전주·전선 -- see the parallel path's own call
+        // for why a fresh claim registry here.
+        if let Some(network) = &kr_road_network {
+            let mut claimed_columns = crate::kr_street_furniture::ClaimedColumns::default();
+            let building_slice: &[crate::kr_buildings::PlannedBuilding] =
+                kr_buildings.as_deref().map(Vec::as_slice).unwrap_or(&[]);
+            crate::kr_street_furniture::place_utility_lines(
+                &mut editor,
+                &network.segments,
+                building_slice,
+                &mut claimed_columns,
+            );
         }
     }
 

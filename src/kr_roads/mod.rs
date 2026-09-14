@@ -281,6 +281,52 @@ pub(crate) fn road_total_width(class: RoadClass) -> i32 {
     section_spec(class).total_width()
 }
 
+/// SPEC_StreetFurniture.md §1's placement column, resolved per grade so
+/// `kr_street_furniture` never needs to know `cross_section_layout`'s band
+/// order: `(left_offset, right_offset)`, both measured the same way
+/// `sweep_and_place` measures offsets (signed, centered on the centerline).
+/// `None` for A (배치하지 않음) and F (아직 다루지 않음 -- 도로 경계 바깥은
+/// 이 함수가 아는 단면 밖의 개념이라 별도 처리가 필요하다).
+///
+/// B/C/D: the sidewalk cell touching the curb ("인도의 연석 쪽 1블록 열").
+/// E: the sidewalk's own outer edge ("인도 안쪽 1블록") -- E has no curb
+/// (`curb_each` is still 1 in `section_spec`, matching §2's own A-example
+/// curb note, but E's *sidewalk* one-column rule reads as the far edge, not
+/// the curb side, so it's picked out separately here rather than reusing
+/// the curb-adjacent search below).
+pub(crate) fn furniture_column(class: RoadClass) -> Option<(i32, i32)> {
+    if matches!(class, RoadClass::A | RoadClass::F) {
+        return None;
+    }
+    let spec = section_spec(class);
+    let layout = cross_section_layout(&spec);
+    if class == RoadClass::E {
+        let left = layout.first()?.0;
+        let right = layout.last()?.0;
+        return Some((left, right));
+    }
+    // The Sidewalk cell adjacent to each Curb cell -- `layout` runs in
+    // increasing-offset order, so the *left* curb's own sidewalk neighbour
+    // sits right before it (more negative offset) and the *right* curb's
+    // sits right after (more positive); checking only "Sidewalk immediately
+    // following a Curb" misses the left side entirely, since there the
+    // sidewalk-to-curb transition runs the other way.
+    let mut left = None;
+    let mut right = None;
+    for (i, &(_, band)) in layout.iter().enumerate() {
+        if band != Band::Curb {
+            continue;
+        }
+        if let Some(&(offset, Band::Sidewalk)) = layout.get(i.wrapping_sub(1)) {
+            left.get_or_insert(offset);
+        }
+        if let Some(&(offset, Band::Sidewalk)) = layout.get(i + 1) {
+            right.get_or_insert(offset);
+        }
+    }
+    Some((left?, right?))
+}
+
 pub struct Segment {
     id: String,
     link_id: String,
@@ -635,8 +681,11 @@ fn resample_to_blocks(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
 /// verbatim from that requirement's own reasoning, not Arnis's RNG.
 /// Currently unused: both call sites are swapped for `DEBUG_ROAD_HIGHLIGHT`
 /// (see that const's doc) and will call back into this once that's reverted.
+/// Also `pub(crate)`: `kr_street_furniture` (SPEC_StreetFurniture.md §9 --
+/// every probabilistic choice there is a coordinate hash too) shares this
+/// one rather than keeping its own copy of the same formula.
 #[allow(dead_code)]
-fn coord_hash(x: i32, z: i32) -> u32 {
+pub(crate) fn coord_hash(x: i32, z: i32) -> u32 {
     let mut h = (x as i64).wrapping_mul(374_761_393) ^ (z as i64).wrapping_mul(668_265_263);
     h ^= h >> 13;
     (h as u32).wrapping_mul(2_246_822_519)
