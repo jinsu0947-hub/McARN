@@ -716,8 +716,20 @@ fn sweep_and_place(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: Roa
     let y_full = y2.div_euclid(2);
     let has_slab = y2.rem_euclid(2) == 1;
 
+    // Empty blacklist, not `None, None`: `register_ground_overrides` (see its
+    // own doc) makes ground generation build terrain *to* this cross-
+    // section's own height, as solid ground -- an "only if the cell is
+    // still empty" write (what `None, None` means, see
+    // `WorldEditor::set_block_with_properties_absolute`'s own doc) would
+    // then always find that cell already filled and silently lose to it,
+    // which is the exact bug this replaced. `highways.rs`'s own road-surface
+    // write is the same shape (blacklist, not if-absent) for the same
+    // reason -- see its `ROAD_PROTECTED_SURFACES`. Nothing placed before
+    // this point in the KR pipeline (ground fill only) needs protecting
+    // from being paved over; buildings run after roads, so this can't
+    // clobber those either.
     let place_full = |editor: &mut WorldEditor, block: crate::block_definitions::Block, px: i32, pz: i32, y: i32| {
-        editor.set_block_absolute(block, px, y, pz, None, None);
+        editor.set_block_absolute(block, px, y, pz, None, Some(&[]));
     };
 
     for (offset, band) in cross_section_layout(&spec) {
@@ -1048,6 +1060,74 @@ pub fn compute_kr_road_network(
         node_height_mismatches,
     };
     Ok((KrRoadNetwork { segments, node_pos, node_y2 }, report))
+}
+
+/// Registers every road/sidewalk cell's flattened surface Y as a
+/// `WorldEditor` ground-surface override, mirroring
+/// `element_processing/highways.rs`'s own `register_road_surface_y` calls --
+/// see that function's doc for the mechanism. Without this, ground
+/// generation independently fills terrain to the real DEM height at every
+/// column, and `sweep_and_place`'s writes go through
+/// `set_block_absolute(.., None, None)` -- an "only if the cell is still
+/// empty" write (`WorldEditor::set_block_with_properties_absolute`'s own
+/// doc) -- so wherever real terrain already reaches or exceeds the road's
+/// target height, the road write silently loses to whatever ground
+/// generation placed there first. Measured on a real (sloped, coastal) run:
+/// ~20% of centerline points, unrelated to tile boundaries or buildings.
+///
+/// **Must run before ground generation sees the tile/world it's registering
+/// into** -- registering afterward (e.g. alongside `place_segments`, which
+/// itself is split per-tile purely for the eviction reason its own doc
+/// gives) is too late for ground generation to have already built to it,
+/// and defeats the purpose even though the override write itself would
+/// still land in time for anything reading `get_ground_level` later.
+/// `road_surface_overrides` is a plain in-memory map with no disk-eviction
+/// concern of its own, so unlike `place_segments` this has no reason to be
+/// split per-tile -- callers just need to run it against whichever
+/// `WorldEditor` ground generation is about to run on, before it runs.
+pub fn register_ground_overrides<'a>(editor: &mut WorldEditor, segments: impl IntoIterator<Item = &'a Segment>) {
+    for seg in segments {
+        for w in seg.points.windows(2) {
+            let dir = ((w[1].x - w[0].x) as f64, (w[1].z - w[0].z) as f64);
+            register_cross_section_ys(editor, w[0].x, w[0].z, w[0].y2, seg.class, dir);
+        }
+        if let Some(last) = seg.points.last() {
+            let dir = if seg.points.len() >= 2 {
+                let p = &seg.points[seg.points.len() - 2];
+                ((last.x - p.x) as f64, (last.z - p.z) as f64)
+            } else {
+                (1.0, 0.0)
+            };
+            register_cross_section_ys(editor, last.x, last.z, last.y2, seg.class, dir);
+        }
+    }
+}
+
+/// One point's cross-section, surface-Y only -- deliberately kept separate
+/// from `sweep_and_place` (rather than sharing one function) so a change to
+/// how blocks get placed can't accidentally change what height ground
+/// generation is told to build to, or vice versa; the two are recomputed
+/// from the same `cross_section_layout`/`section_spec` inputs so they can't
+/// drift on their own, only if someone edits the height formula in one and
+/// not the other.
+fn register_cross_section_ys(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: RoadClass, dir: (f64, f64)) {
+    let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(1e-6);
+    let perp = (-dir.1 / len, dir.0 / len);
+    let spec = section_spec(class);
+    let y_full = y2.div_euclid(2);
+    let has_slab = y2.rem_euclid(2) == 1;
+    for (offset, band) in cross_section_layout(&spec) {
+        let px = x + (perp.0 * offset as f64).round() as i32;
+        let pz = z + (perp.1 * offset as f64).round() as i32;
+        let surface_y = match band {
+            Band::Sidewalk => {
+                let sidewalk_y2 = y2 + CURB_HEIGHT_Y2;
+                sidewalk_y2.div_euclid(2) + i32::from(sidewalk_y2.rem_euclid(2) == 1)
+            }
+            _ => y_full + i32::from(has_slab),
+        };
+        editor.register_road_surface_y(px, pz, surface_y);
+    }
 }
 
 /// SPEC_RoadProfile.md P6/P7: sweeps and writes blocks for `segments` into

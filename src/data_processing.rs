@@ -1226,6 +1226,30 @@ pub fn generate_world_with_options(
                         tile_bounds.max_z - 1,
                     );
 
+                    // Computed once here (not re-filtered again down at `place_segments`)
+                    // so the exact same segment set backs the ground-override
+                    // registration below and the later placement + continuity check.
+                    let kr_matching_segments: Vec<_> = kr_road_network
+                        .as_ref()
+                        .map(|network| {
+                            network
+                                .segments
+                                .iter()
+                                .filter(|seg| {
+                                    let (min_x, max_x, min_z, max_z) = seg.aabb();
+                                    min_x < tile_bounds.max_x
+                                        && max_x >= tile_bounds.min_x
+                                        && min_z < tile_bounds.max_z
+                                        && max_z >= tile_bounds.min_z
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    // SPEC_Build.md §1 road-continuity fix: register ground-surface
+                    // overrides *before* this tile's own ground generation runs below --
+                    // see `kr_roads::register_ground_overrides`'s own doc for why.
+                    crate::kr_roads::register_ground_overrides(&mut tile_editor, kr_matching_segments.iter().copied());
+
                     let mut tile_rail_tunnel_points: Vec<(i32, i32)> = Vec::new();
                     let mut tile_tunnel_cells: Vec<highways::HighwayTunnelCell> = Vec::new();
 
@@ -1333,19 +1357,8 @@ pub fn generate_world_with_options(
                     // grade's full section width, so this doesn't miss the sweep's
                     // sideways splash near a tile boundary.
                     let mut tile_road_unplaced: Vec<(i32, i32)> = Vec::new();
-                    if let Some(network) = &kr_road_network {
-                        let matching: Vec<_> = network
-                            .segments
-                            .iter()
-                            .filter(|seg| {
-                                let (min_x, max_x, min_z, max_z) = seg.aabb();
-                                min_x < tile_bounds.max_x
-                                    && max_x >= tile_bounds.min_x
-                                    && min_z < tile_bounds.max_z
-                                    && max_z >= tile_bounds.min_z
-                            })
-                            .collect();
-                        crate::kr_roads::place_segments(&mut tile_editor, matching.iter().copied());
+                    if kr_road_network.is_some() {
+                        crate::kr_roads::place_segments(&mut tile_editor, kr_matching_segments.iter().copied());
                         // SPEC_Build.md §1 road-continuity check -- see `verify_placement`'s
                         // own doc for why this must run here, in-tile, right after placement.
                         // Clamped to `xzbbox`, not just `tile_bounds`: tiles are rounded up to
@@ -1355,7 +1368,7 @@ pub fn generate_world_with_options(
                         // as false "gaps" (same clamp `g_min_x`/`g_max_x` above already apply).
                         tile_road_unplaced = crate::kr_roads::verify_placement(
                             &tile_editor,
-                            matching.iter().copied(),
+                            kr_matching_segments.iter().copied(),
                             (
                                 tile_bounds.min_x.max(xzbbox.min_x()),
                                 tile_bounds.min_z.max(xzbbox.min_z()),
@@ -1634,6 +1647,17 @@ pub fn generate_world_with_options(
     // the small-area sequential path, or the whole-bbox-ground override. The
     // parallel per-tile path already did ground + ore + water inside the closure.
     let ground_on_merged = !use_parallel_tiles;
+
+    // SPEC_Build.md §1 road-continuity fix: register every KR road/sidewalk
+    // cell's flattened height as a ground-surface override *before* ground
+    // generation runs on this (single, small-world) editor -- see
+    // `kr_roads::register_ground_overrides`'s own doc for why order matters
+    // and why this can't just happen alongside `place_segments` below.
+    if ground_on_merged {
+        if let Some(network) = &kr_road_network {
+            crate::kr_roads::register_ground_overrides(&mut editor, &network.segments);
+        }
+    }
 
     if ground_on_merged {
         ground_generation::generate_ground_layer(
