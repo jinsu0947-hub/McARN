@@ -59,7 +59,6 @@
 //!   none here (roads are placed directly from vector data, not extracted
 //!   from a rendered world). 표준노드링크's fields (§3.1) carry no explicit
 //!   bridge/tunnel flag either. Every link is treated as `GROUND`.
-//! - P8 (주변 지형 정리: taper/retaining walls) is not implemented.
 //! - SPEC_RoadSection §3 (도색/횡단보도), §4 (교차로 연석 반경), §6.5
 //!   (중앙분리대 조경) and street furniture are excluded per this task's own
 //!   scope, not an oversight.
@@ -1089,7 +1088,9 @@ pub fn register_ground_overrides<'a>(editor: &mut WorldEditor, segments: impl In
     for seg in segments {
         for w in seg.points.windows(2) {
             let dir = ((w[1].x - w[0].x) as f64, (w[1].z - w[0].z) as f64);
-            register_cross_section_ys(editor, w[0].x, w[0].z, w[0].y2, seg.class, dir);
+            let (left, right) = register_cross_section_ys(editor, w[0].x, w[0].z, w[0].y2, seg.class, dir);
+            register_taper(editor, left, edge_perp(dir, true));
+            register_taper(editor, right, edge_perp(dir, false));
         }
         if let Some(last) = seg.points.last() {
             let dir = if seg.points.len() >= 2 {
@@ -1098,9 +1099,27 @@ pub fn register_ground_overrides<'a>(editor: &mut WorldEditor, segments: impl In
             } else {
                 (1.0, 0.0)
             };
-            register_cross_section_ys(editor, last.x, last.z, last.y2, seg.class, dir);
+            let (left, right) = register_cross_section_ys(editor, last.x, last.z, last.y2, seg.class, dir);
+            register_taper(editor, left, edge_perp(dir, true));
+            register_taper(editor, right, edge_perp(dir, false));
         }
     }
+}
+
+/// SPEC_RoadProfile.md §4: `TAPER_WIDTH` (P8's own interpolation width, blocks)
+/// and `RETAINING_THRESHOLD` (height gap above which a taper is replaced by
+/// a retaining wall, blocks).
+const TAPER_WIDTH: i32 = 4;
+const RETAINING_THRESHOLD: i32 = 3;
+
+/// The unit perpendicular pointing *outward* from a cross-section edge --
+/// `left` continues in `-perp`, `right` in `+perp` (see `cross_section_layout`:
+/// offsets run from `-left_extent` up, so the leftmost cell's own outward
+/// direction is negative, the rightmost's positive).
+fn edge_perp(dir: (f64, f64), left: bool) -> (f64, f64) {
+    let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(1e-6);
+    let perp = (-dir.1 / len, dir.0 / len);
+    if left { (-perp.0, -perp.1) } else { perp }
 }
 
 /// One point's cross-section, surface-Y only -- deliberately kept separate
@@ -1110,12 +1129,26 @@ pub fn register_ground_overrides<'a>(editor: &mut WorldEditor, segments: impl In
 /// from the same `cross_section_layout`/`section_spec` inputs so they can't
 /// drift on their own, only if someone edits the height formula in one and
 /// not the other.
-fn register_cross_section_ys(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: RoadClass, dir: (f64, f64)) {
+///
+/// Returns the two outer-edge cells `(px, pz, surface_y)` -- leftmost offset
+/// first, rightmost second -- so P8's taper/retaining-wall decision (see
+/// `register_taper`/`place_retaining_walls`) doesn't need to walk the
+/// cross-section a second time to find them.
+fn register_cross_section_ys(
+    editor: &mut WorldEditor,
+    x: i32,
+    z: i32,
+    y2: i32,
+    class: RoadClass,
+    dir: (f64, f64),
+) -> ((i32, i32, i32), (i32, i32, i32)) {
     let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(1e-6);
     let perp = (-dir.1 / len, dir.0 / len);
     let spec = section_spec(class);
     let y_full = y2.div_euclid(2);
     let has_slab = y2.rem_euclid(2) == 1;
+    let mut left_edge = None;
+    let mut right_edge = None;
     for (offset, band) in cross_section_layout(&spec) {
         let px = x + (perp.0 * offset as f64).round() as i32;
         let pz = z + (perp.1 * offset as f64).round() as i32;
@@ -1127,6 +1160,132 @@ fn register_cross_section_ys(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, 
             _ => y_full + i32::from(has_slab),
         };
         editor.register_road_surface_y(px, pz, surface_y);
+        if left_edge.is_none() {
+            left_edge = Some((px, pz, surface_y));
+        }
+        right_edge = Some((px, pz, surface_y));
+    }
+    (left_edge.unwrap(), right_edge.unwrap())
+}
+
+/// SPEC_RoadProfile.md P8 "주변 지형 정리": starting at `edge` (a cross-section
+/// outer-edge cell) and continuing `TAPER_WIDTH` blocks outward along
+/// `out_dir`, linearly interpolate a ground-height override from the edge's
+/// own height toward the real, unoverridden terrain height at the far end --
+/// so ground generation (which reads these overrides, see
+/// `register_ground_overrides`'s own doc) builds a ramp instead of leaving a
+/// bare step where the road's flattened cross-section meets raw terrain.
+///
+/// If the real terrain at the far end is more than `RETAINING_THRESHOLD`
+/// blocks from the edge, skip the taper entirely -- SPEC_RoadProfile.md's
+/// own reasoning ("억지로 흙을 쌓거나 깎는 것보다 결과가 깔끔하다"): forcing
+/// a fill/cut over just 4 blocks across a real cliff would be a near-vertical
+/// ramp, uglier than a wall. `place_retaining_walls` (run after ground
+/// generation, alongside `place_segments`) recomputes this same edge/gap
+/// independently and places an actual wall there instead.
+///
+/// "GROUND 픽셀에만 적용한다": skips any taper cell sitting over water --
+/// `get_water_level` is the same check `WorldEditor::water_source_is_enclosed`
+/// uses to read the land-cover-driven water surface, so this stays consistent
+/// with how the rest of the editor already tells water from dry ground.
+fn register_taper(editor: &mut WorldEditor, edge: (i32, i32, i32), out_dir: (f64, f64)) {
+    let (ex, ez, ey) = edge;
+    let far_x = ex + (out_dir.0 * TAPER_WIDTH as f64).round() as i32;
+    let far_z = ez + (out_dir.1 * TAPER_WIDTH as f64).round() as i32;
+    let Some(h0_far) = editor.terrain_level(far_x, far_z) else { return };
+    if (h0_far - ey).abs() > RETAINING_THRESHOLD {
+        return; // `place_retaining_walls` handles this edge instead.
+    }
+    for dist in 1..=TAPER_WIDTH {
+        let px = ex + (out_dir.0 * dist as f64).round() as i32;
+        let pz = ez + (out_dir.1 * dist as f64).round() as i32;
+        if editor.get_water_level(px, pz) > 0 {
+            continue;
+        }
+        let t = dist as f64 / TAPER_WIDTH as f64;
+        let target = (ey as f64 * (1.0 - t) + h0_far as f64 * t).round() as i32;
+        editor.register_road_surface_y(px, pz, target);
+    }
+}
+
+/// SPEC_RoadProfile.md P8's other half: where `register_taper` declined
+/// (real terrain more than `RETAINING_THRESHOLD` blocks from the road's own
+/// edge), build an actual retaining wall instead of leaving the bare cliff
+/// that a plain flattened cross-section next to unmodified terrain would
+/// show. Must run *after* ground generation (recomputes the same edge
+/// geometry `register_ground_overrides` used, but this time needs the real
+/// placed world under it, not just `Ground`) -- call alongside
+/// `place_segments`, same editor, same call.
+pub fn place_retaining_walls<'a>(editor: &mut WorldEditor, segments: impl IntoIterator<Item = &'a Segment>) {
+    for seg in segments {
+        for w in seg.points.windows(2) {
+            let dir = ((w[1].x - w[0].x) as f64, (w[1].z - w[0].z) as f64);
+            let (left, right) = cross_section_edges(w[0].x, w[0].z, w[0].y2, seg.class, dir);
+            place_wall_if_needed(editor, left, edge_perp(dir, true));
+            place_wall_if_needed(editor, right, edge_perp(dir, false));
+        }
+        if let Some(last) = seg.points.last() {
+            let dir = if seg.points.len() >= 2 {
+                let p = &seg.points[seg.points.len() - 2];
+                ((last.x - p.x) as f64, (last.z - p.z) as f64)
+            } else {
+                (1.0, 0.0)
+            };
+            let (left, right) = cross_section_edges(last.x, last.z, last.y2, seg.class, dir);
+            place_wall_if_needed(editor, left, edge_perp(dir, true));
+            place_wall_if_needed(editor, right, edge_perp(dir, false));
+        }
+    }
+}
+
+/// Same two-edge computation as `register_cross_section_ys`, minus the
+/// `register_road_surface_y` side effect -- `place_retaining_walls` runs
+/// after ground generation, when re-registering overrides would do nothing
+/// useful (ground has already been built).
+fn cross_section_edges(x: i32, z: i32, y2: i32, class: RoadClass, dir: (f64, f64)) -> ((i32, i32, i32), (i32, i32, i32)) {
+    let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(1e-6);
+    let perp = (-dir.1 / len, dir.0 / len);
+    let spec = section_spec(class);
+    let y_full = y2.div_euclid(2);
+    let has_slab = y2.rem_euclid(2) == 1;
+    let mut left_edge = None;
+    let mut right_edge = None;
+    for (offset, band) in cross_section_layout(&spec) {
+        let px = x + (perp.0 * offset as f64).round() as i32;
+        let pz = z + (perp.1 * offset as f64).round() as i32;
+        let surface_y = match band {
+            Band::Sidewalk => {
+                let sidewalk_y2 = y2 + CURB_HEIGHT_Y2;
+                sidewalk_y2.div_euclid(2) + i32::from(sidewalk_y2.rem_euclid(2) == 1)
+            }
+            _ => y_full + i32::from(has_slab),
+        };
+        if left_edge.is_none() {
+            left_edge = Some((px, pz, surface_y));
+        }
+        right_edge = Some((px, pz, surface_y));
+    }
+    (left_edge.unwrap(), right_edge.unwrap())
+}
+
+fn place_wall_if_needed(editor: &mut WorldEditor, edge: (i32, i32, i32), out_dir: (f64, f64)) {
+    use crate::block_definitions::STONE_BRICKS;
+    let (ex, ez, ey) = edge;
+    let wx = ex + (out_dir.0 * TAPER_WIDTH as f64).round() as i32;
+    let wz = ez + (out_dir.1 * TAPER_WIDTH as f64).round() as i32;
+    if editor.get_water_level(wx, wz) > 0 {
+        return;
+    }
+    let Some(h0) = editor.terrain_level(wx, wz) else { return };
+    if (h0 - ey).abs() <= RETAINING_THRESHOLD {
+        return; // `register_taper` already handled this edge with a ramp.
+    }
+    // A solid face right at the edge, spanning the whole gap the taper
+    // declined to bridge -- holds the higher side back regardless of
+    // whether the road cut into the slope or sits up on fill.
+    let (lo, hi) = (ey.min(h0), ey.max(h0));
+    for y in lo..=hi {
+        editor.set_block_absolute(STONE_BRICKS, ex, y, ez, None, Some(&[]));
     }
 }
 

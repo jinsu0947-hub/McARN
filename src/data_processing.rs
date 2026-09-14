@@ -1359,6 +1359,11 @@ pub fn generate_world_with_options(
                     let mut tile_road_unplaced: Vec<(i32, i32)> = Vec::new();
                     if kr_road_network.is_some() {
                         crate::kr_roads::place_segments(&mut tile_editor, kr_matching_segments.iter().copied());
+                        // SPEC_RoadProfile.md P8 "주변 지형 정리", retaining-wall half --
+                        // see `place_retaining_walls`'s own doc for why this needs to run
+                        // after ground generation (unlike the taper half, registered
+                        // earlier by `register_ground_overrides`).
+                        crate::kr_roads::place_retaining_walls(&mut tile_editor, kr_matching_segments.iter().copied());
                         // SPEC_Build.md §1 road-continuity check -- see `verify_placement`'s
                         // own doc for why this must run here, in-tile, right after placement.
                         // Clamped to `xzbbox`, not just `tile_bounds`: tiles are rounded up to
@@ -1695,6 +1700,9 @@ pub fn generate_world_with_options(
     if !use_parallel_tiles {
         if let Some(network) = &kr_road_network {
             crate::kr_roads::place_segments(&mut editor, &network.segments);
+            // SPEC_RoadProfile.md P8, retaining-wall half -- see
+            // `place_retaining_walls`'s own doc.
+            crate::kr_roads::place_retaining_walls(&mut editor, &network.segments);
             // SPEC_Build.md §1 road-continuity check -- one editor, no tiles here,
             // so it owns the whole world bbox (see `verify_placement`'s own doc).
             let unplaced = crate::kr_roads::verify_placement(
