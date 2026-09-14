@@ -514,6 +514,29 @@ fn available_memory_mb() -> u64 {
     sys.available_memory() / (1024 * 1024)
 }
 
+/// SPEC_Build.md §1 "도로 연속성" (road continuity) automated check's report --
+/// see `kr_roads::verify_placement`'s own doc for what it checks and why it
+/// has to run in-tile, right after placement, rather than as a later pass.
+/// Prints every unplaced point capped at 20 (a real gap is worth finding by
+/// hand; a run with hundreds is a systemic bug, not something to read off a
+/// wall of coordinates) and reports the exact count regardless.
+fn report_kr_road_placement(unplaced: &[(i32, i32)]) {
+    if unplaced.is_empty() {
+        println!("KR roads: road-continuity check -- every centerline point has a placed road block.");
+        return;
+    }
+    println!(
+        "KR roads: road-continuity check -- {} centerline point(s) with NO road block placed:",
+        unplaced.len()
+    );
+    for &(x, z) in unplaced.iter().take(20) {
+        println!("  [UNPLACED ROAD] x={x} z={z}");
+    }
+    if unplaced.len() > 20 {
+        println!("  ... and {} more", unplaced.len() - 20);
+    }
+}
+
 /// Generate world with explicit format options (used by GUI for Bedrock support)
 #[allow(clippy::too_many_arguments)]
 pub fn generate_world_with_options(
@@ -1162,6 +1185,9 @@ pub fn generate_world_with_options(
         let mut last_emitted_pct = 20.0_f64;
         // Placement-side ticks so the bar moves before the first batch merges.
         let tiles_placed = std::sync::atomic::AtomicUsize::new(0);
+        // SPEC_Build.md §1 road-continuity check, aggregated across every tile --
+        // see `kr_roads::verify_placement`'s doc.
+        let mut kr_road_unplaced: Vec<(i32, i32)> = Vec::new();
         for batch in indexed_tiles.chunks(tile_batch_size) {
             // Phase 1: process this batch of tiles in parallel
             let place_start = std::time::Instant::now();
@@ -1306,15 +1332,37 @@ pub fn generate_world_with_options(
                     // geometry intersects. `Segment::aabb` is pre-padded by that
                     // grade's full section width, so this doesn't miss the sweep's
                     // sideways splash near a tile boundary.
+                    let mut tile_road_unplaced: Vec<(i32, i32)> = Vec::new();
                     if let Some(network) = &kr_road_network {
-                        let matching = network.segments.iter().filter(|seg| {
-                            let (min_x, max_x, min_z, max_z) = seg.aabb();
-                            min_x < tile_bounds.max_x
-                                && max_x >= tile_bounds.min_x
-                                && min_z < tile_bounds.max_z
-                                && max_z >= tile_bounds.min_z
-                        });
-                        crate::kr_roads::place_segments(&mut tile_editor, matching);
+                        let matching: Vec<_> = network
+                            .segments
+                            .iter()
+                            .filter(|seg| {
+                                let (min_x, max_x, min_z, max_z) = seg.aabb();
+                                min_x < tile_bounds.max_x
+                                    && max_x >= tile_bounds.min_x
+                                    && min_z < tile_bounds.max_z
+                                    && max_z >= tile_bounds.min_z
+                            })
+                            .collect();
+                        crate::kr_roads::place_segments(&mut tile_editor, matching.iter().copied());
+                        // SPEC_Build.md §1 road-continuity check -- see `verify_placement`'s
+                        // own doc for why this must run here, in-tile, right after placement.
+                        // Clamped to `xzbbox`, not just `tile_bounds`: tiles are rounded up to
+                        // 512-block region boundaries (`tile::create_tiles`), so an edge tile's
+                        // own bounds reach past the world's actual requested edge -- checking
+                        // that unclamped range flags points nothing was ever supposed to touch
+                        // as false "gaps" (same clamp `g_min_x`/`g_max_x` above already apply).
+                        tile_road_unplaced = crate::kr_roads::verify_placement(
+                            &tile_editor,
+                            matching.iter().copied(),
+                            (
+                                tile_bounds.min_x.max(xzbbox.min_x()),
+                                tile_bounds.min_z.max(xzbbox.min_z()),
+                                tile_bounds.max_x.min(xzbbox.max_x() + 1),
+                                tile_bounds.max_z.min(xzbbox.max_z() + 1),
+                            ),
+                        );
                     }
 
                     // SPEC_Build.md M4 step ("건물 생성"): same eviction-safe
@@ -1348,6 +1396,7 @@ pub fn generate_world_with_options(
                         tile_rail_tunnel_points,
                         tile_tunnel_cells,
                         tile_road_overrides,
+                        tile_road_unplaced,
                     )
                 })
                 .collect();
@@ -1362,8 +1411,10 @@ pub fn generate_world_with_options(
                 tile_rail_tunnel_points,
                 tile_tunnel_cells,
                 tile_road_overrides,
+                tile_road_unplaced,
             ) in batch_results
             {
+                kr_road_unplaced.extend(tile_road_unplaced);
                 editor.merge_world(
                     tile_world,
                     tiles[tile_idx].min_x,
@@ -1444,6 +1495,10 @@ pub fn generate_world_with_options(
                 model_regions.len(),
                 real_regions.len()
             );
+        }
+
+        if kr_road_network.is_some() {
+            report_kr_road_placement(&kr_road_unplaced);
         }
 
         emit_gui_progress_update_ex(70.0, "", eviction_active);
@@ -1616,6 +1671,14 @@ pub fn generate_world_with_options(
     if !use_parallel_tiles {
         if let Some(network) = &kr_road_network {
             crate::kr_roads::place_segments(&mut editor, &network.segments);
+            // SPEC_Build.md §1 road-continuity check -- one editor, no tiles here,
+            // so it owns the whole world bbox (see `verify_placement`'s own doc).
+            let unplaced = crate::kr_roads::verify_placement(
+                &editor,
+                &network.segments,
+                (xzbbox.min_x(), xzbbox.min_z(), xzbbox.max_x() + 1, xzbbox.max_z() + 1),
+            );
+            report_kr_road_placement(&unplaced);
         }
         if let Some(buildings) = &kr_buildings {
             crate::kr_buildings::place_buildings(&mut editor, buildings.iter());

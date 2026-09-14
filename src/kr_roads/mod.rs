@@ -634,6 +634,9 @@ fn resample_to_blocks(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
 /// Deterministic per-column hash for the material variation SPEC_RoadSection
 /// §6.1 requires to be reproducible ("반드시 좌표 해시로 결정") -- reused
 /// verbatim from that requirement's own reasoning, not Arnis's RNG.
+/// Currently unused: both call sites are swapped for `DEBUG_ROAD_HIGHLIGHT`
+/// (see that const's doc) and will call back into this once that's reverted.
+#[allow(dead_code)]
 fn coord_hash(x: i32, z: i32) -> u32 {
     let mut h = (x as i64).wrapping_mul(374_761_393) ^ (z as i64).wrapping_mul(668_265_263);
     h ^= h >> 13;
@@ -689,6 +692,15 @@ fn cross_section_layout(spec: &SectionSpec) -> Vec<(i32, Band)> {
         .collect()
 }
 
+/// TEMPORARY road-vs-building color collision workaround -- see the two
+/// `DEBUG_ROAD_HIGHLIGHT` use sites in `sweep_and_place` for the full
+/// rationale and the exact revert. Remove this const and both use sites once
+/// `map_renderer.rs`'s preview can tell a road block from a building block on
+/// its own (e.g. by consulting `WorldEditor::road_surface_overrides`, which
+/// `sweep_and_place` doesn't currently populate either -- see that field's
+/// own doc).
+const DEBUG_ROAD_HIGHLIGHT: crate::block_definitions::Block = crate::block_definitions::RED_CONCRETE;
+
 /// SPEC_RoadProfile.md P6/P7 + SPEC_RoadSection.md §1/§2, combined: sweeps
 /// the fixed cross-section for `class` across the perpendicular at `point`,
 /// writing roadway/curb/sidewalk blocks at `y2`. `dir` is the (unit-ish)
@@ -714,7 +726,17 @@ fn sweep_and_place(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: Roa
 
         match band {
             Band::Sidewalk => {
-                let block = if coord_hash(px, pz) % 2 == 0 { LIGHT_GRAY_CONCRETE } else { POLISHED_ANDESITE };
+                // TEMPORARY (see map_renderer.rs's own doc comment on road-vs-
+                // building color collision): the real fix belongs in the map
+                // preview renderer, which can't currently tell a road's
+                // LIGHT_GRAY_CONCRETE from a building's -- both share the same
+                // block palette, so the top-down preview can't distinguish
+                // them. Until that's fixed, use a block the KR building
+                // palette never touches (kr_buildings/facade.rs) so roads are
+                // at least visible in the preview. Revert to the
+                // LIGHT_GRAY_CONCRETE/POLISHED_ANDESITE checker pattern this
+                // replaced once the renderer is road-aware.
+                let block = DEBUG_ROAD_HIGHLIGHT;
                 let sidewalk_y2 = y2 + CURB_HEIGHT_Y2;
                 place_full(editor, block, px, pz, sidewalk_y2.div_euclid(2));
                 if sidewalk_y2.rem_euclid(2) == 1 {
@@ -740,14 +762,10 @@ fn sweep_and_place(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: Roa
                 }
             }
             Band::Shoulder | Band::Carriage => {
-                let h = coord_hash(px, pz) % 100;
-                let block = if h < 3 {
-                    BLACK_CONCRETE
-                } else if h < 8 {
-                    LIGHT_GRAY_CONCRETE
-                } else {
-                    GRAY_CONCRETE
-                };
+                // TEMPORARY -- see the Sidewalk arm above; same reason, same
+                // revert (the h<3/h<8 BLACK_CONCRETE/LIGHT_GRAY_CONCRETE/
+                // GRAY_CONCRETE weathering mix this replaced).
+                let block = DEBUG_ROAD_HIGHLIGHT;
                 place_full(editor, block, px, pz, y_full);
                 if has_slab {
                     place_full(editor, block, px, pz, y_full + 1);
@@ -1059,6 +1077,66 @@ pub fn place_segments<'a>(editor: &mut WorldEditor, segments: impl IntoIterator<
             sweep_and_place(editor, last.x, last.z, last.y2, seg.class, dir);
         }
     }
+}
+
+/// SPEC_Build.md §1 "도로 연속성" (road continuity) automated check: unlike
+/// `compute_kr_road_network`'s report (slope violations, node height
+/// mismatches -- both checked against the *solved height model*, before any
+/// block is written), this checks the *actual placed world*: for every
+/// centerline point owned by `owned`, was a road/sidewalk-family block really
+/// written near its computed height? Must run right after `place_segments`
+/// writes into `editor`, in the same call -- never as a later post-merge
+/// pass -- for the same eviction reason `place_segments` itself is split per
+/// module doc: a flushed region has no disk-read path back.
+///
+/// `owned` is (min_x, min_z, max_x, max_z), max exclusive, matching
+/// `tile::TileBounds`. Points outside it are skipped: the same segment is
+/// placed redundantly into every tile its padded aabb overlaps (see the
+/// `place_segments` call site), and only the strictly-owning tile's copy
+/// survives merge, so checking a halo copy would double-count one tile's
+/// point and never check another's. The small-world sequential caller (one
+/// editor, no tiles) passes the whole world bbox instead.
+///
+/// The block set mirrors exactly what `sweep_and_place` writes for every
+/// band except the sidewalk (offset 0 -- the centerline point itself -- is
+/// always inside the roadway/curb/median bands, never the outer sidewalk
+/// band, for every grade in `section_spec`). Returns the unplaced points.
+pub fn verify_placement<'a>(
+    editor: &WorldEditor,
+    segments: impl IntoIterator<Item = &'a Segment>,
+    owned: (i32, i32, i32, i32),
+) -> Vec<(i32, i32)> {
+    use crate::block_definitions::*;
+    // Includes DEBUG_ROAD_HIGHLIGHT (RED_CONCRETE) alongside the real palette
+    // sweep_and_place normally writes -- see that const's doc. Keep both listed
+    // so this check stays correct before and after that temporary swap is
+    // reverted, instead of silently false-negatives-ing on whichever isn't there.
+    const ROAD_FAMILY: [Block; 8] = [
+        GRAY_CONCRETE,
+        LIGHT_GRAY_CONCRETE,
+        POLISHED_ANDESITE,
+        BLACK_CONCRETE,
+        SMOOTH_STONE_SLAB,
+        STONE_BRICKS,
+        YELLOW_CONCRETE,
+        DEBUG_ROAD_HIGHLIGHT,
+    ];
+    let (min_x, min_z, max_x, max_z) = owned;
+    let mut unplaced = Vec::new();
+    for seg in segments {
+        for p in &seg.points {
+            if p.x < min_x || p.x >= max_x || p.z < min_z || p.z >= max_z {
+                continue;
+            }
+            let y_full = p.y2.div_euclid(2);
+            let found = (-1..=1)
+                .any(|dy| editor.get_block_absolute(p.x, y_full + dy, p.z).is_some_and(|b| ROAD_FAMILY.contains(&b)));
+            if !found {
+                unplaced.push((p.x, p.z));
+            }
+        }
+    }
+    unplaced
 }
 
 pub fn write_roadgraph_json(
