@@ -281,6 +281,12 @@ pub(crate) fn road_total_width(class: RoadClass) -> i32 {
     section_spec(class).total_width()
 }
 
+/// SPEC_StreetFurniture.md §3.1's "인도 폭이 3블록 미만이면 승차대를
+/// 생략한다" check -- one side's sidewalk width, in blocks.
+pub(crate) fn sidewalk_width(class: RoadClass) -> i32 {
+    section_spec(class).outer_each
+}
+
 /// SPEC_StreetFurniture.md §1's placement column, resolved per grade so
 /// `kr_street_furniture` never needs to know `cross_section_layout`'s band
 /// order: `(left_offset, right_offset)`, both measured the same way
@@ -321,6 +327,33 @@ pub(crate) fn furniture_column(class: RoadClass) -> Option<(i32, i32)> {
             left.get_or_insert(offset);
         }
         if let Some(&(offset, Band::Sidewalk)) = layout.get(i + 1) {
+            right.get_or_insert(offset);
+        }
+    }
+    Some((left?, right?))
+}
+
+/// SPEC_StreetFurniture.md §3.3 (정류소 노면 표시): the Carriage cell
+/// touching each Curb -- "차도 가장자리", the paved edge, one column in from
+/// `furniture_column`'s sidewalk cell. Same neighbour-of-Curb search as
+/// `furniture_column`, just landing on the other side of each Curb cell.
+/// `None` for classes with no Carriage/Curb split (A is excluded by
+/// `section_spec` having no callers that reach it without a driving surface
+/// anyway; F has no curb at all, `curb_each` 0, so no Curb cell ever exists
+/// to search from).
+pub(crate) fn carriage_edge_column(class: RoadClass) -> Option<(i32, i32)> {
+    let spec = section_spec(class);
+    let layout = cross_section_layout(&spec);
+    let mut left = None;
+    let mut right = None;
+    for (i, &(_, band)) in layout.iter().enumerate() {
+        if band != Band::Curb {
+            continue;
+        }
+        if let Some(&(offset, Band::Carriage | Band::Shoulder)) = layout.get(i + 1) {
+            left.get_or_insert(offset);
+        }
+        if let Some(&(offset, Band::Carriage | Band::Shoulder)) = layout.get(i.wrapping_sub(1)) {
             right.get_or_insert(offset);
         }
     }

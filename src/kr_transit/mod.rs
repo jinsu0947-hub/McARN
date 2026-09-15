@@ -73,7 +73,7 @@ struct StopMatchInfo {
 }
 
 #[derive(Serialize)]
-struct StopEntry {
+pub struct StopEntry {
     stop_id: String,
     name: String,
     pos: [i32; 2],
@@ -82,6 +82,16 @@ struct StopEntry {
     shelter: Option<bool>,
     #[serde(rename = "match")]
     match_info: StopMatchInfo,
+}
+
+impl StopEntry {
+    /// SPEC_Build.md M5 §3's read side: real stop coordinates -- `y2` and
+    /// `shelter` stay `None` here (this module doc's own reason: neither
+    /// `Ground` nor M5's own furniture-column resolution exist at M2 time),
+    /// M5 computes both itself against the already-built world instead.
+    pub fn pos(&self) -> (i32, i32) {
+        (self.pos[0], self.pos[1])
+    }
 }
 
 #[derive(Serialize)]
@@ -106,6 +116,12 @@ pub struct StopsDocument {
     stops: Vec<StopEntry>,
     routes: Vec<RouteEntry>,
     unplaced: Vec<UnplacedEntry>,
+}
+
+impl StopsDocument {
+    pub fn stops(&self) -> &[StopEntry] {
+        &self.stops
+    }
 }
 
 /// Writes `stops.json` (SPEC_Build.md §3.3) into `dir` -- the world's parent

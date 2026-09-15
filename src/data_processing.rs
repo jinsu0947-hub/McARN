@@ -944,41 +944,47 @@ pub fn generate_world_with_options(
     // are given; omitting either keeps M0/M1 behaviour completely unchanged
     // (no `stops.json`, no buffer-based tile scoping) -- existing runs, KR
     // or otherwise, are unaffected by this flag's mere existence.
-    let kr_buffer_tiles: Option<HashSet<(i32, i32)>> = if args.input_source == crate::args::InputSource::Kr {
-        if let (Some(bus_stops_dir), Some(bus_routes_csv)) = (&args.kr_bus_stops_dir, &args.kr_bus_routes_csv) {
-            let planar = args
-                .korea_planar_bbox
-                .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
-            let roads_dir = args.kr_roads_dir.as_ref().expect(
-                "validate_args requires --kr-roads-dir alongside --kr-bus-stops-dir/--kr-bus-routes-csv \
-                 (M2's route polylines route through M1's own 표준노드링크 graph)",
-            );
-            match crate::kr_transit::build_m2(bus_stops_dir, bus_routes_csv, roads_dir, &planar, args.scale) {
-                Ok((doc, reports, chunks)) => {
-                    crate::kr_transit::print_route_report(&reports);
-                    let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
-                    if let Err(e) = crate::kr_transit::write_stops_json(&graph_output_dir, &doc) {
-                        eprintln!("Warning: KR transit: failed to write stops.json: {e}");
+    // `kr_stops_doc` is kept (not just used here for stops.json/tile scoping)
+    // for SPEC_Build.md M5 §3's bus-stop placement -- see
+    // `kr_street_furniture::place_bus_stops`'s own doc for why real stop
+    // coordinates, not `furniture_column`'s generic curb-side column, drive
+    // where those go.
+    let (kr_buffer_tiles, kr_stops_doc): (Option<HashSet<(i32, i32)>>, Option<Arc<crate::kr_transit::StopsDocument>>) =
+        if args.input_source == crate::args::InputSource::Kr {
+            if let (Some(bus_stops_dir), Some(bus_routes_csv)) = (&args.kr_bus_stops_dir, &args.kr_bus_routes_csv) {
+                let planar = args
+                    .korea_planar_bbox
+                    .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
+                let roads_dir = args.kr_roads_dir.as_ref().expect(
+                    "validate_args requires --kr-roads-dir alongside --kr-bus-stops-dir/--kr-bus-routes-csv \
+                     (M2's route polylines route through M1's own 표준노드링크 graph)",
+                );
+                match crate::kr_transit::build_m2(bus_stops_dir, bus_routes_csv, roads_dir, &planar, args.scale) {
+                    Ok((doc, reports, chunks)) => {
+                        crate::kr_transit::print_route_report(&reports);
+                        let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
+                        if let Err(e) = crate::kr_transit::write_stops_json(&graph_output_dir, &doc) {
+                            eprintln!("Warning: KR transit: failed to write stops.json: {e}");
+                        }
+                        // Chunk (16-block) -> tile (512-block, `tile::DEFAULT_TILE_SIZE`)
+                        // granularity: `create_tiles` and the tile loop below only ever
+                        // skip or keep a whole tile, never part of one.
+                        let buffer_tiles: HashSet<(i32, i32)> =
+                            chunks.into_iter().map(|(cx, cz)| (cx.div_euclid(32), cz.div_euclid(32))).collect();
+                        println!("KR transit: L0 buffer covers {} tile(s) of 512 blocks each", buffer_tiles.len());
+                        (Some(buffer_tiles), Some(Arc::new(doc)))
                     }
-                    // Chunk (16-block) -> tile (512-block, `tile::DEFAULT_TILE_SIZE`)
-                    // granularity: `create_tiles` and the tile loop below only ever
-                    // skip or keep a whole tile, never part of one.
-                    let buffer_tiles: HashSet<(i32, i32)> =
-                        chunks.into_iter().map(|(cx, cz)| (cx.div_euclid(32), cz.div_euclid(32))).collect();
-                    println!("KR transit: L0 buffer covers {} tile(s) of 512 blocks each", buffer_tiles.len());
-                    Some(buffer_tiles)
+                    Err(e) => {
+                        eprintln!("Warning: KR transit (M2) failed: {e}");
+                        (None, None)
+                    }
                 }
-                Err(e) => {
-                    eprintln!("Warning: KR transit (M2) failed: {e}");
-                    None
-                }
+            } else {
+                (None, None)
             }
         } else {
-            None
-        }
-    } else {
-        None
-    };
+            (None, None)
+        };
 
     // SPEC_Build.md M4 "건물": solved once, here, after M1's road network --
     // see `kr_buildings`' module doc. Needs `--kr-buildings-shp` and
@@ -1397,15 +1403,20 @@ pub fn generate_world_with_options(
                         crate::kr_buildings::place_buildings(&mut tile_editor, matching);
                     }
 
-                    // SPEC_Build.md M5 step ("가로 요소"), §2 전주·전선 first
-                    // per SPEC_StreetFurniture.md §0's own priority -- same
-                    // per-tile/eviction-safe placement as roads/buildings
-                    // above. A fresh claim registry per tile, since this
-                    // tile's own editor is what §8 priority is being
-                    // resolved against; bus stops (once implemented) will
-                    // claim into the same map before this call runs.
+                    // SPEC_Build.md M5 step ("가로 요소") -- same per-tile/
+                    // eviction-safe placement as roads/buildings above. §8's
+                    // priority (정류장 > 전주 > ...) means bus stops claim
+                    // into `claimed_columns` before poles get a chance to.
                     if kr_road_network.is_some() {
                         let mut claimed_columns = crate::kr_street_furniture::ClaimedColumns::default();
+                        let stops_slice: &[crate::kr_transit::StopEntry] =
+                            kr_stops_doc.as_deref().map(crate::kr_transit::StopsDocument::stops).unwrap_or(&[]);
+                        crate::kr_street_furniture::place_bus_stops(
+                            &mut tile_editor,
+                            stops_slice,
+                            kr_matching_segments.iter().copied(),
+                            &mut claimed_columns,
+                        );
                         let building_slice: &[crate::kr_buildings::PlannedBuilding] =
                             kr_buildings.as_deref().map(Vec::as_slice).unwrap_or(&[]);
                         crate::kr_street_furniture::place_utility_lines(
@@ -1734,10 +1745,13 @@ pub fn generate_world_with_options(
         if let Some(buildings) = &kr_buildings {
             crate::kr_buildings::place_buildings(&mut editor, buildings.iter());
         }
-        // SPEC_Build.md M5, §2 전주·전선 -- see the parallel path's own call
-        // for why a fresh claim registry here.
+        // SPEC_Build.md M5 -- see the parallel path's own call for why a
+        // fresh claim registry here, and why bus stops go first into it.
         if let Some(network) = &kr_road_network {
             let mut claimed_columns = crate::kr_street_furniture::ClaimedColumns::default();
+            let stops_slice: &[crate::kr_transit::StopEntry] =
+                kr_stops_doc.as_deref().map(crate::kr_transit::StopsDocument::stops).unwrap_or(&[]);
+            crate::kr_street_furniture::place_bus_stops(&mut editor, stops_slice, &network.segments, &mut claimed_columns);
             let building_slice: &[crate::kr_buildings::PlannedBuilding] =
                 kr_buildings.as_deref().map(Vec::as_slice).unwrap_or(&[]);
             crate::kr_street_furniture::place_utility_lines(

@@ -1,7 +1,7 @@
 //! SPEC_Build.md M5 "가로 요소". SPEC_StreetFurniture.md §0: "전주와 전선이
-//! 최우선이다" -- §2 (전주·전선) is the only section implemented so far;
-//! the rest (§3 버스정류장, §4 가로등, SPEC_RoadSection.md §3 도색) land in
-//! later passes, in the priority order §0 gives.
+//! 최우선이다" -- §2 (전주·전선) and §3 (버스정류장) are implemented; §4
+//! 가로등 and SPEC_RoadSection.md §3 도색 land in later passes, in the
+//! priority order §0 gives.
 //!
 //! Placement column: every element in this module lives in the single curb-
 //! side sidewalk cell `kr_roads::furniture_column` resolves per road grade
@@ -13,7 +13,8 @@
 
 use crate::block_definitions::*;
 use crate::kr_buildings::{PlannedBuilding, UseGroup};
-use crate::kr_roads::{self, Segment};
+use crate::kr_roads::{self, RoadClass, Segment};
+use crate::kr_transit::StopEntry;
 use crate::world_editor::WorldEditor;
 use fnv::FnvHashMap;
 use std::collections::HashSet;
@@ -237,4 +238,186 @@ fn nearest_service_drop_building<'a>(
         }
     }
     best.map(|(_, x, z, roof_y, idx)| (x, z, roof_y, idx))
+}
+
+// ---------------------------------------------------------------------
+// SPEC_StreetFurniture.md §3 -- 버스정류장
+// ---------------------------------------------------------------------
+
+const SHELTER_HALF_LENGTH: i32 = 3; // "폭 7블록", 3 either side of the stop's own point
+const SHELTER_DEPTH: i32 = 3; // "깊이 3블록", into the sidewalk from the curb
+const SHELTER_HEIGHT: i32 = 5;
+const SIGN_HEIGHT: i32 = 5;
+/// A stop more than this far from the nearest road point is almost
+/// certainly a data mismatch (wrong route, or a stop this run's bbox clips
+/// mid-approach) -- SPEC_StreetFurniture.md gives no explicit cutoff, but
+/// placing a shelter tens of blocks from any road would misread as a
+/// placement bug, not a legitimate stop. `kr_buildings`' own `nearest_front`
+/// has no such cutoff because a building's footprint always has *a* nearest
+/// road by construction; a stop's raw coordinate doesn't have that guarantee.
+const MAX_STOP_TO_ROAD_DIST: i32 = 40;
+
+/// One reference point along the road network: position, the grade at that
+/// point, and the local forward direction (from this point to the next).
+struct RoadRef {
+    x: i32,
+    z: i32,
+    class: RoadClass,
+    dir: (f64, f64),
+}
+
+/// Places every stop in `stops` (SPEC_Build.md M2's `stops.json` positions)
+/// per SPEC_StreetFurniture.md §3: a shelter for B/C/D grades with room for
+/// one (§3.1), a stand-alone sign otherwise (§3.2), and a road-paint edge
+/// line the stop's own length (§3.3).
+///
+/// Real coordinates, not `furniture_column`'s generic per-grade column,
+/// decide *where along the road* each stop sits (§3's own "정류소 좌표
+/// 데이터의 각 지점에 배치한다") -- only which *side* and how far into the
+/// sidewalk reuse that resolution, the same way this module's other
+/// elements do.
+///
+/// Must run before `place_utility_lines` and claim into the same
+/// `claimed`: SPEC_StreetFurniture.md §8 puts bus stops first ("정류장이
+/// 최우선인 이유 -- 노선 주행 재현이 목적이므로 정류소는 위치가 정확해야
+/// 한다").
+pub fn place_bus_stops<'a>(
+    editor: &mut WorldEditor,
+    stops: &[StopEntry],
+    segments: impl IntoIterator<Item = &'a Segment>,
+    claimed: &mut ClaimedColumns,
+) {
+    if stops.is_empty() {
+        return;
+    }
+    let refs = collect_road_refs(segments);
+    if refs.is_empty() {
+        return;
+    }
+    for stop in stops {
+        let (sx, sz) = stop.pos();
+        let Some(r) = nearest_road_ref(sx, sz, &refs) else { continue };
+        if (r.x - sx).pow(2) + (r.z - sz).pow(2) > MAX_STOP_TO_ROAD_DIST * MAX_STOP_TO_ROAD_DIST {
+            continue;
+        }
+        let Some((left_off, right_off)) = kr_roads::furniture_column(r.class) else { continue };
+        let perp = (-r.dir.1, r.dir.0);
+        let side_point = |offset: i32| {
+            (r.x + (perp.0 * offset as f64).round() as i32, r.z + (perp.1 * offset as f64).round() as i32)
+        };
+        let (left_x, left_z) = side_point(left_off);
+        let (right_x, right_z) = side_point(right_off);
+        let left_dist2 = (left_x - sx).pow(2) + (left_z - sz).pow(2);
+        let right_dist2 = (right_x - sx).pow(2) + (right_z - sz).pow(2);
+        let (anchor_x, anchor_z, side_sign) =
+            if left_dist2 <= right_dist2 { (left_x, left_z, -1.0) } else { (right_x, right_z, 1.0) };
+        let into_sidewalk = (perp.0 * side_sign, perp.1 * side_sign); // toward the anchor's own side, deeper into the sidewalk
+
+        let spec_allows_shelter = matches!(r.class, RoadClass::B | RoadClass::C | RoadClass::D);
+        let sidewalk_wide_enough = kr_roads::sidewalk_width(r.class) >= 3;
+        let has_shelter = spec_allows_shelter && sidewalk_wide_enough;
+
+        let cell = |along: i32, depth: i32| {
+            (
+                anchor_x + (r.dir.0 * along as f64).round() as i32 + (into_sidewalk.0 * depth as f64).round() as i32,
+                anchor_z + (r.dir.1 * along as f64).round() as i32 + (into_sidewalk.1 * depth as f64).round() as i32,
+            )
+        };
+
+        if has_shelter {
+            place_shelter(editor, cell, claimed);
+            place_sign(editor, cell(SHELTER_HALF_LENGTH, 0), claimed);
+        } else {
+            place_sign(editor, (anchor_x, anchor_z), claimed);
+        }
+
+        place_stop_line(editor, r, side_sign);
+    }
+}
+
+fn collect_road_refs<'a>(segments: impl IntoIterator<Item = &'a Segment>) -> Vec<RoadRef> {
+    let mut refs = Vec::new();
+    for seg in segments {
+        let points = seg.points();
+        if points.len() < 2 {
+            continue;
+        }
+        for w in points.windows(2) {
+            let (x0, z0) = w[0].xz();
+            let (x1, z1) = w[1].xz();
+            let len = (((x1 - x0).pow(2) + (z1 - z0).pow(2)) as f64).sqrt();
+            if len < 1e-6 {
+                continue;
+            }
+            refs.push(RoadRef { x: x0, z: z0, class: seg.class(), dir: ((x1 - x0) as f64 / len, (z1 - z0) as f64 / len) });
+        }
+        if let (Some(last), Some(prev)) = (points.last(), points.get(points.len().wrapping_sub(2))) {
+            let (x0, z0) = prev.xz();
+            let (x1, z1) = last.xz();
+            let len = (((x1 - x0).pow(2) + (z1 - z0).pow(2)) as f64).sqrt().max(1e-6);
+            refs.push(RoadRef { x: x1, z: z1, class: seg.class(), dir: ((x1 - x0) as f64 / len, (z1 - z0) as f64 / len) });
+        }
+    }
+    refs
+}
+
+fn nearest_road_ref<'a>(x: i32, z: i32, refs: &'a [RoadRef]) -> Option<&'a RoadRef> {
+    refs.iter().min_by_key(|r| (r.x - x).pow(2) + (r.z - z).pow(2))
+}
+
+fn place_shelter(editor: &mut WorldEditor, cell: impl Fn(i32, i32) -> (i32, i32), claimed: &mut ClaimedColumns) {
+    let (bx, bz) = cell(0, 0);
+    let base = editor.get_ground_level(bx, bz);
+    let is_corner = |a: i32, d: i32| (a == -SHELTER_HALF_LENGTH || a == SHELTER_HALF_LENGTH) && (d == 0 || d == SHELTER_DEPTH - 1);
+    let is_end = |a: i32| a == -SHELTER_HALF_LENGTH || a == SHELTER_HALF_LENGTH;
+    let is_back = |d: i32| d == SHELTER_DEPTH - 1;
+    for a in -SHELTER_HALF_LENGTH..=SHELTER_HALF_LENGTH {
+        for d in 0..SHELTER_DEPTH {
+            let (x, z) = cell(a, d);
+            claimed.entry((x, z)).or_insert("stop");
+            if is_corner(a, d) {
+                for dy in 1..=SHELTER_HEIGHT {
+                    editor.set_block_absolute(LIGHT_GRAY_CONCRETE, x, base + dy, z, None, Some(&[]));
+                }
+            } else if is_end(a) || is_back(d) {
+                for dy in 1..SHELTER_HEIGHT {
+                    editor.set_block_absolute(GLASS_PANE, x, base + dy, z, None, Some(&[]));
+                }
+            }
+            editor.set_block_absolute(SMOOTH_STONE_SLAB, x, base + SHELTER_HEIGHT, z, None, Some(&[]));
+            if is_back(d) && !is_end(a) {
+                editor.set_block_absolute(SMOOTH_STONE_SLAB, x, base + 1, z, None, Some(&[]));
+            }
+        }
+    }
+}
+
+fn place_sign(editor: &mut WorldEditor, (x, z): (i32, i32), claimed: &mut ClaimedColumns) {
+    if claimed.contains_key(&(x, z)) {
+        return; // shelter (if any) already stands here -- same priority tier, first write wins
+    }
+    claimed.insert((x, z), "stop");
+    let base = editor.get_ground_level(x, z);
+    for dy in 1..=SIGN_HEIGHT {
+        editor.set_block_absolute(IRON_BARS, x, base + dy, z, None, Some(&[]));
+    }
+    editor.set_block_absolute(YELLOW_CONCRETE, x, base + SIGN_HEIGHT + 1, z, None, Some(&[]));
+}
+
+/// §3.3: solid yellow line along the carriageway edge, the stop's own
+/// length ("정류소 길이만큼"). Measured from `r`'s own centerline point --
+/// unlike the shelter/sign, this doesn't need the stop's real offset from
+/// it, just which side.
+fn place_stop_line(editor: &mut WorldEditor, r: &RoadRef, side_sign: f64) {
+    let Some((left_off, right_off)) = kr_roads::carriage_edge_column(r.class) else { return };
+    let offset = if side_sign < 0.0 { left_off } else { right_off };
+    let perp = (-r.dir.1, r.dir.0);
+    let ex = r.x + (perp.0 * offset as f64).round() as i32;
+    let ez = r.z + (perp.1 * offset as f64).round() as i32;
+    let base = editor.get_ground_level(ex, ez);
+    for a in -SHELTER_HALF_LENGTH..=SHELTER_HALF_LENGTH {
+        let x = ex + (r.dir.0 * a as f64).round() as i32;
+        let z = ez + (r.dir.1 * a as f64).round() as i32;
+        editor.set_block_absolute(YELLOW_CONCRETE, x, base, z, None, Some(&[]));
+    }
 }
