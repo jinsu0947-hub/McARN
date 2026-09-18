@@ -17,9 +17,10 @@
    - L2/L3 (건물): `kr_buildings::compute_kr_buildings`가 옛 `BUILDING_BUFFER_M`+`route_polylines` 근접 거리 판정 대신 `scope.contains_en(중심점, 0.0)`을 직접 쓴다. **동작이 바뀐 지점**: scope 밖 + 저층인 건물은 이제 **아예 생략**된다(전엔 전부 생성했다) — `KrBuildingsReport.omitted_out_of_scope`로 집계.
    - `data_processing.rs`의 M2/M1/M4 순서를 재배치했다 — `kr_transit::build_m2`(scope 산출)가 M1(`kr_roads`)보다 먼저 실행되어야 L1이 그 `Scope`를 받을 수 있다. 의존 방향 확인됨 (M2는 M1의 `KrRoadNetwork`를 쓰지 않는다, 자기만의 라우팅 그래프를 따로 읽는다).
    - `kr_roads::block_to_en` (`en_to_block`의 역함수), `KoreaTmProjection::unproject_raw`, `Scope::contains_en` 추가.
-   - **검증**: 단위 테스트로 `kr_scope`(7개, EN 왕복 포함)와 `kr_roads::clip()`(scope 포함/제외 양쪽, 합성 fixture) 직접 검증 + `kr_transit`의 실데이터 M2 테스트가 여전히 baseline과 byte-identical. **전체 바이너리 실행(`arnis.exe`)으로 실제 Anvil 월드를 생성해 사각형/508 구간을 블록 단위로 비교하는 것은 하지 않았다** — 이건 plan/compute 단계 검증이지, 사용자가 요청한 "실행" 단계 검증이 아니다. 아직 커밋 안 함.
+   - **검증됨 (compute 단계만)**: 단위 테스트로 `kr_scope`(7개, EN 왕복 포함)와 `kr_roads::clip()`(scope 포함/제외 양쪽, 합성 fixture) 직접 검증 + `kr_transit`의 실데이터 M2 테스트가 여전히 baseline과 byte-identical. 커밋 `d291c1b1` → push.
+   - **검증 안 됨 (미룬 것이지 면제된 것이 아니다)**: 실제 `arnis.exe`를 돌려 Anvil 월드를 생성하고, 사각형만 vs 사각형+508 띠 두 실행의 결과를 블록 단위로 비교하는 것 — 사용자가 원래 요청한 "실행" 검증 — 은 **아직 하지 않았다.** 위 compute-단계 검증은 그 대체물이 아니다: `Scope::contains_en`이 옳은 좌표를 옳게 판정한다는 것과, 그 판정이 실제 생성 파이프라인 전체(지형 보간·도로 종단선형·건물 파사드 등)를 거쳐 baseline과 같은 블록을 낳는다는 것은 별개의 주장이다. §6 "scope 연결 실행 검증" 항목으로 남겨뒀다 — SCALE 파라미터화 작업(§7 item 5)의 전체 실행에 얹어서 한 번에 한다.
 
-**다음 세션(또는 이 세션 재개)이 할 일** — 4번 작업물 커밋 여부/전체 바이너리 실행 검증 필요 여부 확인. §7의 나머지: 2번(교량 프리셋 파일 읽기), 5번(`SCALE` 파라미터화, 1번/4번과 맞물려 있음).
+**다음 세션(또는 이 세션 재개)이 할 일** — §7의 나머지: 2번(교량 프리셋 파일 읽기), 5번(`SCALE` 파라미터화 — 끝나면 그 실행에 §6 "scope 연결 실행 검증"을 얹을 것).
 
 **빌드 전 메모리 확인은 여전히 유효하다.**
 
@@ -119,7 +120,7 @@ arnis.exe --input-source kr \
   --map-preview --downloader curl
 ```
 
-월드 검증은 Rust 안 거치고 Node(`prismarine-provider-anvil`/`prismarine-chunk`)로 저장된 Anvil 리전을 직접 읽는 스크립트를 그때그때 짜서 했다 — 재사용 가능한 스크립트로 남겨두진 않았음. 다음에 비슷한 검증이 필요하면 이 패턴(region 파일 목록 → `anvil.load(cx,cz)` → `chunk.getBlock`)을 다시 짜면 된다.
+월드 검증은 Rust 안 거치고 Node(`prismarine-provider-anvil`/`prismarine-chunk`)로 저장된 Anvil 리전을 직접 읽는 스크립트를 매번 그때그때 짜서 했다. **2026-09-18부터는 아니다** — `scripts/anvil-diff/`에 재사용 가능한 버전을 남겼다(두 월드 폴더 + bbox를 받아 청크 단위 블록 diff 요약을 낸다; 합성 월드를 직접 만들어 실행하는 자체 self-test 포함, `npm test`). 다음에 Anvil 단계 검증이 필요하면 이걸 쓴다 — 새로 짜지 말 것. 사용법은 그 폴더의 `README.md`.
 
 ---
 
@@ -134,6 +135,14 @@ arnis.exe --input-source kr \
 **P1(영도 전역) 재생성** — M5 요소들이 들어간 채로 전체 스코프 한 번 다시 돌려서 완주 확인 안 함 (지금까지는 대교동/남항동 소구역 + P0 1.5km만 테스트).
 
 **프리뷰 렌더러 자체 개선** — 지금은 도로 색을 실제 팔레트로 되돌리는 것으로 건물과의 충돌을 해결했지만(§4의 SPEC_RoadSection §3 도색이 실질적 구분 신호), `map_renderer.rs`가 `road_surface_overrides`를 참고해서 블록 색이 아니라 "이게 도로다"라는 사실 자체로 구분하게 만드는 게 근본적 수정이다. 지금은 안 건드림.
+
+**scope 연결 실행 검증** (2026-09-18, §7 item 1의 마지막 조각 — 미룬 것이지 면제된 것이 아니다). `Scope::contains_en`을 L0/L1/L2 생성 범위에 연결한 코드(커밋 `d291c1b1`)는 단위 테스트와 실데이터 M2 baseline 비교로만 검증됐다 — 실제 바이너리로 월드를 생성해 블록 단위로 비교하는 검증은 아직 하지 않았다. **별도로 돌리지 말고 §7 item 5(`SCALE` 파라미터화) 작업의 전체 실행에 얹는다** (그 작업도 어차피 실제 실행 검증이 필요하므로 한 번에 한다). 절차:
+
+1. 영도 사각형만(scope 조각에서 508 route_strip 제외) 1회 실행 → 월드 A
+2. 영도 사각형 ∪ 508 노선 띠(현재 프리셋 그대로) 1회 실행 → 월드 B
+3. `scripts/anvil-diff`로 A/B를 **사각형 bbox 안에서만** 비교 (`node anvil-diff.js A B --bbox <사각형의 블록 좌표>`) → `totalDiffBlocks: 0`이어야 한다 (사각형 구간은 baseline과 일치, 즉 508 띠 추가가 기존 결과를 건드리지 않는다는 뜻)
+4. 월드 B의 `region/` 폴더에 508 띠 구간(남포동~부산역 쪽) 청크가 실제로 존재하는지 확인 (508 띠 구간은 추가 생성됐다는 뜻 — `anvil-diff`는 두 월드가 공유하는 bbox 안의 "일치 여부"만 보므로 이 부분은 별도 확인)
+5. 3번에서 손실(diff)이 나오면 멈추고 원인부터 보고 — 진행하지 않는다
 
 ---
 
