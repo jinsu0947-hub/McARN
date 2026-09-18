@@ -1425,6 +1425,10 @@ pub fn generate_world_with_options(
                             building_slice,
                             &mut claimed_columns,
                         );
+                        // SPEC_RoadSection.md §3 횡단보도·정지선 -- carriageway
+                        // surface, not the sidewalk furniture column, so no
+                        // `claimed_columns` involvement.
+                        crate::kr_street_furniture::place_crosswalks(&mut tile_editor, kr_matching_segments.iter().copied());
                     }
 
                     let tile_road_overrides = tile_editor.take_road_surface_overrides();
@@ -1760,6 +1764,7 @@ pub fn generate_world_with_options(
                 building_slice,
                 &mut claimed_columns,
             );
+            crate::kr_street_furniture::place_crosswalks(&mut editor, &network.segments);
         }
     }
 

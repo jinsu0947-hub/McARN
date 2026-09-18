@@ -287,6 +287,21 @@ pub(crate) fn sidewalk_width(class: RoadClass) -> i32 {
     section_spec(class).outer_each
 }
 
+/// SPEC_RoadSection.md §3's crosswalk/stop-line width: half the paved
+/// (non-sidewalk) cross-section, so a caller sweeping `-w..=w` from the
+/// centerline covers curb-to-curb without spilling onto the sidewalk.
+pub(crate) fn carriageway_half_width(class: RoadClass) -> i32 {
+    section_spec(class).total_width() / 2 - section_spec(class).outer_each
+}
+
+/// `kr_street_furniture`'s intersection-marking pass (SPEC_RoadSection.md
+/// §3: crosswalks/stop lines at C-and-above intersections) needs each
+/// segment's own endpoint node IDs to find real intersections (a node
+/// several segments share), not just this segment's own geometry.
+pub(crate) fn endpoints(seg: &Segment) -> (&str, &str) {
+    (&seg.f_node, &seg.t_node)
+}
+
 /// SPEC_StreetFurniture.md §1's placement column, resolved per grade so
 /// `kr_street_furniture` never needs to know `cross_section_layout`'s band
 /// order: `(left_offset, right_offset)`, both measured the same way
@@ -712,12 +727,9 @@ fn resample_to_blocks(points: &[(f64, f64)]) -> Vec<(f64, f64)> {
 /// Deterministic per-column hash for the material variation SPEC_RoadSection
 /// §6.1 requires to be reproducible ("반드시 좌표 해시로 결정") -- reused
 /// verbatim from that requirement's own reasoning, not Arnis's RNG.
-/// Currently unused: both call sites are swapped for `DEBUG_ROAD_HIGHLIGHT`
-/// (see that const's doc) and will call back into this once that's reverted.
-/// Also `pub(crate)`: `kr_street_furniture` (SPEC_StreetFurniture.md §9 --
-/// every probabilistic choice there is a coordinate hash too) shares this
-/// one rather than keeping its own copy of the same formula.
-#[allow(dead_code)]
+/// `pub(crate)`: `kr_street_furniture` (SPEC_StreetFurniture.md §9 -- every
+/// probabilistic choice there is a coordinate hash too) shares this one
+/// rather than keeping its own copy of the same formula.
 pub(crate) fn coord_hash(x: i32, z: i32) -> u32 {
     let mut h = (x as i64).wrapping_mul(374_761_393) ^ (z as i64).wrapping_mul(668_265_263);
     h ^= h >> 13;
@@ -773,15 +785,6 @@ fn cross_section_layout(spec: &SectionSpec) -> Vec<(i32, Band)> {
         .collect()
 }
 
-/// TEMPORARY road-vs-building color collision workaround -- see the two
-/// `DEBUG_ROAD_HIGHLIGHT` use sites in `sweep_and_place` for the full
-/// rationale and the exact revert. Remove this const and both use sites once
-/// `map_renderer.rs`'s preview can tell a road block from a building block on
-/// its own (e.g. by consulting `WorldEditor::road_surface_overrides`, which
-/// `sweep_and_place` doesn't currently populate either -- see that field's
-/// own doc).
-const DEBUG_ROAD_HIGHLIGHT: crate::block_definitions::Block = crate::block_definitions::RED_CONCRETE;
-
 /// SPEC_RoadProfile.md P6/P7 + SPEC_RoadSection.md §1/§2, combined: sweeps
 /// the fixed cross-section for `class` across the perpendicular at `point`,
 /// writing roadway/curb/sidewalk blocks at `y2`. `dir` is the (unit-ish)
@@ -819,17 +822,13 @@ fn sweep_and_place(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: Roa
 
         match band {
             Band::Sidewalk => {
-                // TEMPORARY (see map_renderer.rs's own doc comment on road-vs-
-                // building color collision): the real fix belongs in the map
-                // preview renderer, which can't currently tell a road's
-                // LIGHT_GRAY_CONCRETE from a building's -- both share the same
-                // block palette, so the top-down preview can't distinguish
-                // them. Until that's fixed, use a block the KR building
-                // palette never touches (kr_buildings/facade.rs) so roads are
-                // at least visible in the preview. Revert to the
-                // LIGHT_GRAY_CONCRETE/POLISHED_ANDESITE checker pattern this
-                // replaced once the renderer is road-aware.
-                let block = DEBUG_ROAD_HIGHLIGHT;
+                // SPEC_RoadSection.md §6.4 인도: base/variant checker, 2-block
+                // period ("기본과 변주를 2블록 주기로 교대"). The map-preview
+                // road/building color collision `DEBUG_ROAD_HIGHLIGHT` used to
+                // paper over here is gone now that SPEC_RoadSection.md §3
+                // 도색 (median/lane paint, crosswalk stripes) gives the
+                // preview a real way to tell roads from buildings.
+                let block = if coord_hash(px, pz) % 2 == 0 { LIGHT_GRAY_CONCRETE } else { POLISHED_ANDESITE };
                 let sidewalk_y2 = y2 + CURB_HEIGHT_Y2;
                 place_full(editor, block, px, pz, sidewalk_y2.div_euclid(2));
                 if sidewalk_y2.rem_euclid(2) == 1 {
@@ -855,10 +854,17 @@ fn sweep_and_place(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: Roa
                 }
             }
             Band::Shoulder | Band::Carriage => {
-                // TEMPORARY -- see the Sidewalk arm above; same reason, same
-                // revert (the h<3/h<8 BLACK_CONCRETE/LIGHT_GRAY_CONCRETE/
-                // GRAY_CONCRETE weathering mix this replaced).
-                let block = DEBUG_ROAD_HIGHLIGHT;
+                // SPEC_RoadSection.md §6.1 차도: base surface plus coordinate-
+                // hashed repair-patch/weathering variation ("얼룩은 반드시
+                // 좌표 해시로 결정").
+                let h = coord_hash(px, pz) % 100;
+                let block = if h < 3 {
+                    BLACK_CONCRETE
+                } else if h < 8 {
+                    LIGHT_GRAY_CONCRETE
+                } else {
+                    GRAY_CONCRETE
+                };
                 place_full(editor, block, px, pz, y_full);
                 if has_slab {
                     place_full(editor, block, px, pz, y_full + 1);
@@ -1428,11 +1434,7 @@ pub fn verify_placement<'a>(
     owned: (i32, i32, i32, i32),
 ) -> Vec<(i32, i32)> {
     use crate::block_definitions::*;
-    // Includes DEBUG_ROAD_HIGHLIGHT (RED_CONCRETE) alongside the real palette
-    // sweep_and_place normally writes -- see that const's doc. Keep both listed
-    // so this check stays correct before and after that temporary swap is
-    // reverted, instead of silently false-negatives-ing on whichever isn't there.
-    const ROAD_FAMILY: [Block; 8] = [
+    const ROAD_FAMILY: [Block; 7] = [
         GRAY_CONCRETE,
         LIGHT_GRAY_CONCRETE,
         POLISHED_ANDESITE,
@@ -1440,7 +1442,6 @@ pub fn verify_placement<'a>(
         SMOOTH_STONE_SLAB,
         STONE_BRICKS,
         YELLOW_CONCRETE,
-        DEBUG_ROAD_HIGHLIGHT,
     ];
     let (min_x, min_z, max_x, max_z) = owned;
     let mut unplaced = Vec::new();

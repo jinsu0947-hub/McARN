@@ -1,7 +1,9 @@
 //! SPEC_Build.md M5 "가로 요소". SPEC_StreetFurniture.md §0: "전주와 전선이
-//! 최우선이다" -- §2 (전주·전선) and §3 (버스정류장) are implemented; §4
-//! 가로등 and SPEC_RoadSection.md §3 도색 land in later passes, in the
-//! priority order §0 gives.
+//! 최우선이다" -- §2 (전주·전선), §3 (버스정류장), and SPEC_RoadSection.md §3
+//! (교차로 횡단보도·정지선) are implemented; §4 가로등 and §3's 차선 점선
+//! (3차로 이상 도로에만 적용되는 백색 점선 -- 실제 `lanes` 데이터가 있는
+//! 세그먼트가 적어 뒤로 미뤘다, 명시적 제외이지 누락이 아니다) land in a
+//! later pass.
 //!
 //! Placement column: every element in this module lives in the single curb-
 //! side sidewalk cell `kr_roads::furniture_column` resolves per road grade
@@ -419,5 +421,100 @@ fn place_stop_line(editor: &mut WorldEditor, r: &RoadRef, side_sign: f64) {
         let x = ex + (r.dir.0 * a as f64).round() as i32;
         let z = ez + (r.dir.1 * a as f64).round() as i32;
         editor.set_block_absolute(YELLOW_CONCRETE, x, base, z, None, Some(&[]));
+    }
+}
+
+// ---------------------------------------------------------------------
+// SPEC_RoadSection.md §3 -- 횡단보도·정지선
+// ---------------------------------------------------------------------
+
+/// "횡단보도 길이 6블록" (§3, ×1.75 표).
+const CROSSWALK_LENGTH: i32 = 6;
+/// Distance back from the intersection node the crosswalk's near edge
+/// sits, clear of SPEC_RoadSection.md §4's own curb radius (8-20 blocks) --
+/// a fixed, conservative setback rather than reading that radius back out
+/// of the (not-yet-modelled here) intersection geometry.
+const CROSSWALK_SETBACK: i32 = 10;
+
+/// Places a crosswalk + stop line on every C-grade-or-above segment's
+/// approach to a real intersection (a node 3+ segment-ends touch -- a
+/// through-node where one road just continues doesn't count). §3's own
+/// rule: "횡단보도: C등급 이상 교차로의 각 진입부. D 이하는 생략."
+pub fn place_crosswalks<'a>(editor: &mut WorldEditor, segments: impl IntoIterator<Item = &'a Segment> + Clone) {
+    let mut node_degree: FnvHashMap<&str, u32> = FnvHashMap::default();
+    for seg in segments.clone() {
+        let (f, t) = kr_roads::endpoints(seg);
+        *node_degree.entry(f).or_insert(0) += 1;
+        *node_degree.entry(t).or_insert(0) += 1;
+    }
+
+    for seg in segments {
+        if !matches!(seg.class(), RoadClass::A | RoadClass::B | RoadClass::C) {
+            continue;
+        }
+        let points = seg.points();
+        if points.len() < 2 {
+            continue;
+        }
+        let (f, t) = kr_roads::endpoints(seg);
+        if node_degree.get(f).copied().unwrap_or(0) >= 3 {
+            place_one_crosswalk(editor, seg.class(), points, false);
+        }
+        if node_degree.get(t).copied().unwrap_or(0) >= 3 {
+            place_one_crosswalk(editor, seg.class(), points, true);
+        }
+    }
+}
+
+/// `from_end`: approach the intersection from the segment's *last* point
+/// backward, instead of its first point forward -- the same points list
+/// either way, just walked from the other side.
+fn place_one_crosswalk(editor: &mut WorldEditor, class: RoadClass, points: &[kr_roads::ProfilePoint], from_end: bool) {
+    let n = points.len();
+    // Walk inward from the intersection end by CROSSWALK_SETBACK blocks
+    // (points run roughly 1 block apart), then need CROSSWALK_LENGTH more
+    // beyond that for the stripes themselves.
+    let idx_at = |steps_in: usize| -> usize {
+        if from_end { n - 1 - steps_in.min(n - 1) } else { steps_in.min(n - 1) }
+    };
+    let near_idx = idx_at(CROSSWALK_SETBACK as usize);
+    let far_idx = idx_at((CROSSWALK_SETBACK + CROSSWALK_LENGTH) as usize);
+    if near_idx == far_idx {
+        return; // segment too short for both a setback and a crosswalk
+    }
+    let (nx, nz) = points[near_idx].xz();
+    let (fx, fz) = points[far_idx].xz();
+    let dx = (fx - nx) as f64;
+    let dz = (fz - nz) as f64;
+    let len = (dx * dx + dz * dz).sqrt();
+    if len < 1.0 {
+        return;
+    }
+    let dir = (dx / len, dz / len);
+    let perp = (-dir.1, dir.0);
+    let half_w = kr_roads::carriageway_half_width(class);
+    let base = editor.get_ground_level(nx, nz);
+
+    // Stop line: one solid row, right at the crosswalk's near edge (the
+    // side closer to the intersection the vehicle is stopping for).
+    for w in -half_w..=half_w {
+        let x = nx + (perp.0 * w as f64).round() as i32;
+        let z = nz + (perp.1 * w as f64).round() as i32;
+        editor.set_block_absolute(WHITE_CONCRETE, x, base, z, None, Some(&[]));
+    }
+
+    // Crosswalk: alternating 1-block stripes across CROSSWALK_LENGTH,
+    // starting one block past the stop line so the two don't merge into
+    // one wide band.
+    for step in 1..=CROSSWALK_LENGTH {
+        let cx = nx + (dir.0 * step as f64).round() as i32;
+        let cz = nz + (dir.1 * step as f64).round() as i32;
+        let stripe = step % 2 == 1;
+        for w in -half_w..=half_w {
+            let x = cx + (perp.0 * w as f64).round() as i32;
+            let z = cz + (perp.1 * w as f64).round() as i32;
+            let block = if stripe { WHITE_CONCRETE } else { GRAY_CONCRETE };
+            editor.set_block_absolute(block, x, base, z, None, Some(&[]));
+        }
     }
 }
