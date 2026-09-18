@@ -202,7 +202,7 @@ pub fn build_stops_document(
     planar: &KoreaPlanarBBox,
     scale: f64,
     scope_pieces: &[ScopePieceInput],
-) -> Result<(StopsDocument, Vec<RouteReport>), String> {
+) -> Result<(StopsDocument, Vec<RouteReport>, Scope), String> {
     let stops = load_bus_stops(bus_stops_dir, planar, scale)?;
     let route_data = load_route_stops(route_csv)?;
     let name_index = matching::build_name_index(&stops);
@@ -363,16 +363,18 @@ pub fn build_stops_document(
         })
         .collect();
 
-    Ok((StopsDocument { stops: stops_out, routes: route_entries, unplaced: unplaced_entries }, reports))
+    Ok((StopsDocument { stops: stops_out, routes: route_entries, unplaced: unplaced_entries }, reports, scope))
 }
 
-/// SPEC_GenerationScope.md §6's named parameters. `STUB_LENGTH_M`
-/// (branch-road stub length) belongs to L1 road generation, not this
-/// module's buffer/chunk-list computation -- named here anyway so all three
-/// live next to their shared source, and picked up once L1 is wired in.
+/// `SPEC_Scope_v0.2.md §6`'s named parameters, shared across L0/L1
+/// (`data_processing`'s tile filtering, `kr_roads`) since they're both
+/// `Scope::contains_en` tolerances applied to the one `Scope` this module
+/// resolves (§ [`build_stops_document`]). L2 has no equivalent constant
+/// anymore -- a building's "near enough" test used to be a separate
+/// `BUILDING_BUFFER_M` radius; now it's just `Scope::contains_en(.., 0.0)`,
+/// since a route_strip piece already carries its own buffer width
+/// (`SPEC_Scope §1.1`'s `buffer_m`, e.g. 508's 150m in the Yeongdo preset).
 pub const TERRAIN_BUFFER_M: f64 = 1000.0;
-pub const BUILDING_BUFFER_M: f64 = 150.0;
-#[allow(dead_code)]
 pub const STUB_LENGTH_M: f64 = 50.0;
 
 /// Fills in each [`RouteEntry`]'s `links` (SPEC_Build.md §3.2: "경유 링크
@@ -456,62 +458,15 @@ pub(crate) fn build_route_polylines(
     Ok(polylines)
 }
 
-fn point_segment_distance(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
-    let (dx, dz) = (b.0 - a.0, b.1 - a.1);
-    let len2 = dx * dx + dz * dz;
-    if len2 < 1e-9 {
-        return ((p.0 - a.0).powi(2) + (p.1 - a.1).powi(2)).sqrt();
-    }
-    let t = (((p.0 - a.0) * dx + (p.1 - a.1) * dz) / len2).clamp(0.0, 1.0);
-    let (cx, cz) = (a.0 + t * dx, a.1 + t * dz);
-    ((p.0 - cx).powi(2) + (p.1 - cz).powi(2)).sqrt()
-}
-
-/// SPEC_GenerationScope.md §0/§2: the chunks (16-block Minecraft columns)
-/// within `buffer_blocks` of any point on any route's polyline -- the L0
-/// terrain footprint, which per §4 "L0 버퍼가 전체 예산을 좌우한다" is what
-/// actually bounds the chunk budget (L2's tighter building buffer is a mask
-/// *within* this set, not a separate inclusion boundary; L3's whole-rectangle
-/// high-rise scan is deferred to M4, when building data exists to scan at
-/// all -- this function doesn't claim to cover it).
-///
-/// Walked per polyline *segment*, not per point: a per-point disc of this
-/// radius would repeat the same chunk cells from every one of a polyline's
-/// many closely-spaced points, while a segment's own bounding rectangle
-/// (padded by the buffer) is barely larger than the segment itself.
-pub fn buffer_chunks(polylines: &HashMap<String, Vec<[i32; 2]>>, buffer_blocks: i32) -> std::collections::HashSet<(i32, i32)> {
-    const CHUNK: i32 = 16;
-    let mut chunks = std::collections::HashSet::new();
-    for points in polylines.values() {
-        for w in points.windows(2) {
-            let a = (w[0][0] as f64, w[0][1] as f64);
-            let b = (w[1][0] as f64, w[1][1] as f64);
-            let min_x = a.0.min(b.0) as i32 - buffer_blocks;
-            let max_x = a.0.max(b.0) as i32 + buffer_blocks;
-            let min_z = a.1.min(b.1) as i32 - buffer_blocks;
-            let max_z = a.1.max(b.1) as i32 + buffer_blocks;
-            let (cx0, cx1) = (min_x.div_euclid(CHUNK), max_x.div_euclid(CHUNK));
-            let (cz0, cz1) = (min_z.div_euclid(CHUNK), max_z.div_euclid(CHUNK));
-            for cx in cx0..=cx1 {
-                for cz in cz0..=cz1 {
-                    if chunks.contains(&(cx, cz)) {
-                        continue;
-                    }
-                    let center = ((cx * CHUNK + CHUNK / 2) as f64, (cz * CHUNK + CHUNK / 2) as f64);
-                    if point_segment_distance(center, a, b) <= buffer_blocks as f64 {
-                        chunks.insert((cx, cz));
-                    }
-                }
-            }
-        }
-    }
-    chunks
-}
-
 /// Runs every M2 step in order: match + scope + truncate (§
-/// [`build_stops_document`]), route the road network between consecutive
-/// kept stops to fill in `routes[].links` and get each route's polyline,
-/// then buffer those polylines into the L0 terrain chunk list.
+/// [`build_stops_document`]), then routes the road network between
+/// consecutive kept stops to fill in `routes[].links` (`SPEC_Build §3.2`)
+/// and each route's polyline. The L0 terrain chunk list is no longer
+/// computed here -- it used to be a buffer around these routed polylines,
+/// which made L0 depend on road-network routing for no real reason
+/// (`SPEC_Scope §2`'s L0 is `scope + TERRAIN_BUFFER`, and `scope` alone
+/// already has everything that needs). `data_processing.rs` now derives L0
+/// directly from the `Scope` this returns, via `Scope::contains_en`.
 pub fn build_m2(
     bus_stops_dir: &Path,
     route_csv: &Path,
@@ -519,17 +474,10 @@ pub fn build_m2(
     planar: &KoreaPlanarBBox,
     scale: f64,
     scope_pieces: &[ScopePieceInput],
-) -> Result<(StopsDocument, Vec<RouteReport>, std::collections::HashSet<(i32, i32)>), String> {
-    let (mut doc, reports) = build_stops_document(bus_stops_dir, route_csv, planar, scale, scope_pieces)?;
-    let polylines = build_route_polylines(&mut doc, moct_dir, planar, scale)?;
-    let buffer_blocks = (TERRAIN_BUFFER_M * scale).round() as i32;
-    let chunks = buffer_chunks(&polylines, buffer_blocks);
-    println!(
-        "KR transit: L0 terrain buffer ({TERRAIN_BUFFER_M:.0}m -> {buffer_blocks} blocks) covers {} chunks ({} regions)",
-        chunks.len(),
-        chunks.iter().map(|&(cx, cz)| (cx.div_euclid(32), cz.div_euclid(32))).collect::<std::collections::HashSet<_>>().len()
-    );
-    Ok((doc, reports, chunks))
+) -> Result<(StopsDocument, Vec<RouteReport>, Scope), String> {
+    let (mut doc, reports, scope) = build_stops_document(bus_stops_dir, route_csv, planar, scale, scope_pieces)?;
+    build_route_polylines(&mut doc, moct_dir, planar, scale)?;
+    Ok((doc, reports, scope))
 }
 
 /// Prints the per-route report table plus a separate, short list of routes
@@ -588,7 +536,7 @@ mod tests {
         let planar = KoreaPlanarBBox::new(0.0, 0.0, 1_000_000.0, 1_000_000.0).unwrap();
         let scope_pieces = crate::kr_scope::presets::yeongdo();
 
-        let (doc, reports, chunks) = build_m2(bus_stops_dir, route_csv, moct_dir, &planar, 1.75, &scope_pieces).unwrap();
+        let (doc, reports, _scope) = build_m2(bus_stops_dir, route_csv, moct_dir, &planar, 1.75, &scope_pieces).unwrap();
 
         for r in &reports {
             assert_eq!(
@@ -599,7 +547,12 @@ mod tests {
             );
             assert_eq!(r.kept + r.cut, r.high + r.medium + r.low, "kept+cut must equal every placed stop for route {}", r.route_no);
         }
-        assert!(!chunks.is_empty(), "the L0 buffer must cover at least one chunk");
+        // 508 must still keep its full mainland extent (route_strip self-qualifies,
+        // SPEC_Scope §4.1.1) -- 부산역 is well outside the Yeongdo rect.
+        assert!(
+            doc.stops.iter().any(|s| s.name == "부산역" && s.routes.iter().any(|r| r == "508")),
+            "508 must still reach 부산역 outside the Yeongdo rect"
+        );
         for route in &doc.routes {
             if route.route_id == "508" {
                 assert!(!route.links.is_empty(), "508 must have routed at least one road link");

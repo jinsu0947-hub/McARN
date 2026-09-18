@@ -66,7 +66,11 @@ impl RoadGraph {
     /// `None` rather than a route that silently jumps outside the clip.
     pub fn load(dir: &Path, en_bbox: (f64, f64, f64, f64)) -> Result<Self, String> {
         let (raw_nodes, raw_links) = load_raw(dir)?;
-        let (nodes, links) = clip(raw_nodes, raw_links, en_bbox);
+        // No scope filter here: routing between two stops legitimately needs
+        // roads outside scope (SPEC_Scope §2 L1) to connect them -- only the
+        // bbox clip (this graph's whole reason for a padded `en_bbox`, see
+        // this fn's own doc) applies.
+        let (nodes, links) = clip(raw_nodes, raw_links, en_bbox, None);
 
         let mut ids = Vec::with_capacity(nodes.len());
         let mut positions = Vec::with_capacity(nodes.len());

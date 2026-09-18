@@ -510,17 +510,37 @@ fn load_raw(dir: &Path) -> Result<(Vec<RawNode>, Vec<RawLink>), String> {
 }
 
 /// SPEC_Ingest.md §3's own scoping note ("전국 배포본이므로 부산 영도·중구·
-/// 동구 일대만 잘라 쓴다") applied as a plain EN-metres bounding-box filter:
-/// this run's own generation bbox already sits inside that area, so filtering
-/// to it both scopes the load and is the only clip precision this task's
-/// generation actually needs.
-fn clip(nodes: Vec<RawNode>, links: Vec<RawLink>, en_bbox: (f64, f64, f64, f64)) -> (Vec<RawNode>, Vec<RawLink>) {
+/// 동구 일대만 잘라 쓴다") applied as a plain EN-metres bounding-box filter,
+/// plus -- when `scope` is given -- `SPEC_Scope_v0.2.md §2`'s L1 rule ("scope
+/// 내 전부 + `STUB_LENGTH` 스텁"): a link survives only if it also has at
+/// least one point within `STUB_LENGTH_M` of `scope`. `scope` is `None` when
+/// this run has no bus route/preset data (`SPEC_Scope §5.2`'s "프리셋 없음"
+/// default) -- the bbox clip alone is unchanged behaviour then.
+///
+/// This is a whole-link approximation of the stub rule, not a literal
+/// mid-link truncation-and-taper: a link that reaches within
+/// `STUB_LENGTH_M` of scope is kept *in full*, even if most of it lies
+/// farther out, rather than being cut at the exact `STUB_LENGTH_M` mark and
+/// blended back into terrain (`SPEC_RoadProfile P8`, which has no scope-aware
+/// entry point yet). Good enough for "옆길이 뚝 끊겨 도시로 보이지 않는다"
+/// (`SPEC_Scope §2`'s own reason for the stub existing at all); literal
+/// truncation is future work.
+fn clip(
+    nodes: Vec<RawNode>,
+    links: Vec<RawLink>,
+    en_bbox: (f64, f64, f64, f64),
+    scope: Option<&crate::kr_scope::Scope>,
+) -> (Vec<RawNode>, Vec<RawLink>) {
     let (e_min, n_min, e_max, n_max) = en_bbox;
     let in_bbox = |e: f64, n: f64| e >= e_min && e <= e_max && n >= n_min && n <= n_max;
 
     let links: Vec<RawLink> = links
         .into_iter()
         .filter(|l| l.points_en.iter().any(|&(e, n)| in_bbox(e, n)))
+        .filter(|l| match scope {
+            None => true,
+            Some(s) => l.points_en.iter().any(|&(e, n)| s.contains_en(e, n, crate::kr_transit::STUB_LENGTH_M)),
+        })
         .collect();
 
     let mut needed_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -544,6 +564,15 @@ pub(crate) fn en_to_block(e: f64, n: f64, planar: &KoreaPlanarBBox, scale: f64) 
     // e/n envelope), whose `n_min` is the geometric minimum -- i.e. also the
     // south edge. Consistent with `main.rs`'s own e0/n0 usage.
     (x, z)
+}
+
+/// The inverse of [`en_to_block`] -- used by `data_processing.rs`'s L0 tile
+/// filtering (`SPEC_Scope §2`) to test a tile's centre against
+/// `kr_scope::Scope::contains_en`, which works in EN metres, not blocks.
+pub(crate) fn block_to_en(x: f64, z: f64, planar: &KoreaPlanarBBox, scale: f64) -> (f64, f64) {
+    let e = x / scale + planar.e_min();
+    let n = planar.n_min() - z / scale;
+    (e, n)
 }
 
 /// Terrain height (Minecraft Y) at this world block column, read straight
@@ -936,6 +965,7 @@ pub fn compute_kr_road_network(
     planar: &KoreaPlanarBBox,
     scale: f64,
     roads_dir: &Path,
+    scope: Option<&crate::kr_scope::Scope>,
 ) -> Result<(KrRoadNetwork, KrRoadsReport), String> {
     let (raw_nodes, raw_links) = load_raw(roads_dir)?;
     println!(
@@ -946,8 +976,13 @@ pub fn compute_kr_road_network(
     );
 
     let en_bbox = (planar.e_min(), planar.n_min(), planar.e_max(), planar.n_max());
-    let (nodes, links) = clip(raw_nodes, raw_links, en_bbox);
-    println!("KR roads: clipped to this run's bbox -> {} nodes, {} links", nodes.len(), links.len());
+    let (nodes, links) = clip(raw_nodes, raw_links, en_bbox, scope);
+    println!(
+        "KR roads: clipped to this run's bbox{} -> {} nodes, {} links",
+        if scope.is_some() { " + scope (SPEC_Scope §2 L1)" } else { "" },
+        nodes.len(),
+        links.len()
+    );
     // ROAD_NAME (SPEC_Ingest.md §3.1: "표기·확인용") is not consumed by the
     // solver -- its one use is confirming, by eye, that the clip actually
     // caught the streets this run's bbox is supposed to cover.
@@ -1536,6 +1571,70 @@ pub fn write_roadgraph_json(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kr_scope::{Scope, ScopePiece};
+    use crate::projection::korea_tm::KoreaTmProjection;
+
+    fn raw_link(id: &str, f: &str, t: &str, points_en: Vec<(f64, f64)>) -> RawLink {
+        RawLink {
+            link_id: id.to_string(),
+            f_node: f.to_string(),
+            t_node: t.to_string(),
+            lanes: 2,
+            road_rank: "107".to_string(),
+            road_name: String::new(),
+            road_type: String::new(),
+            points_en,
+        }
+    }
+
+    fn raw_node(id: &str, e: f64, n: f64) -> RawNode {
+        RawNode { id: id.to_string(), e, n }
+    }
+
+    /// SPEC_Scope §2 L1 ("scope 내 전부 + STUB_LENGTH 스텁"), and its own
+    /// PROGRESS.md §7 validation requirement: adding a scope on top of the
+    /// bbox clip must never drop a link the bbox alone would have kept
+    /// *and* the scope also reaches, while genuinely dropping one that
+    /// reaches neither scope nor its stub tolerance.
+    #[test]
+    fn clip_with_scope_keeps_links_touching_scope_and_drops_the_rest() {
+        let rect = ScopePiece::Rect { lat_min: 35.060, lon_min: 129.037, lat_max: 35.100, lon_max: 129.090 };
+        let inside_en = KoreaTmProjection::project_raw(35.077, 129.0455); // inside the rect
+        let far_en = KoreaTmProjection::project_raw(35.150, 129.200); // nowhere near it
+        // A link with one endpoint inside scope: kept (SPEC_Scope §2's
+        // stub -- the branch itself, not just its interior, must survive).
+        let near_link = raw_link("L1", "A", "B", vec![inside_en, (inside_en.0 + 20.0, inside_en.1 + 20.0)]);
+        // A link entirely outside scope and outside STUB_LENGTH: dropped.
+        let far_link = raw_link("L2", "C", "D", vec![far_en, (far_en.0 + 20.0, far_en.1 + 20.0)]);
+        let make_nodes = || {
+            vec![
+                raw_node("A", inside_en.0, inside_en.1),
+                raw_node("B", inside_en.0 + 20.0, inside_en.1 + 20.0),
+                raw_node("C", far_en.0, far_en.1),
+                raw_node("D", far_en.0 + 20.0, far_en.1 + 20.0),
+            ]
+        };
+        // en_bbox wide enough to bbox-keep both -- isolating the scope
+        // filter's own effect from the bbox clip's.
+        let en_bbox = (
+            inside_en.0.min(far_en.0) - 100.0,
+            inside_en.1.min(far_en.1) - 100.0,
+            inside_en.0.max(far_en.0) + 100.0,
+            inside_en.1.max(far_en.1) + 100.0,
+        );
+
+        let scope = Scope::new(vec![rect]);
+        let (_, kept_links) = clip(make_nodes(), vec![near_link, far_link], en_bbox, Some(&scope));
+        let kept_ids: Vec<&str> = kept_links.iter().map(|l| l.link_id.as_str()).collect();
+        assert_eq!(kept_ids, vec!["L1"], "scope must keep the in-scope link and drop the far one");
+
+        // Without scope, the bbox clip alone keeps both -- confirms L2's
+        // absence above is the scope filter's doing, not the bbox's.
+        let near_link = raw_link("L1", "A", "B", vec![inside_en, (inside_en.0 + 20.0, inside_en.1 + 20.0)]);
+        let far_link = raw_link("L2", "C", "D", vec![far_en, (far_en.0 + 20.0, far_en.1 + 20.0)]);
+        let (_, kept_links_no_scope) = clip(make_nodes(), vec![near_link, far_link], en_bbox, None);
+        assert_eq!(kept_links_no_scope.len(), 2, "bbox alone (no scope) must keep both");
+    }
 
     #[test]
     fn rank_101_102_is_a_regardless_of_lanes() {

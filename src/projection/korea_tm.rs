@@ -86,6 +86,15 @@ impl KoreaTmProjection {
         tm_forward(lat, lon)
     }
 
+    /// The inverse of [`Self::project_raw`]: EPSG:5186 easting/northing
+    /// metres back to WGS84 degrees. `kr_scope::Scope::contains_en` uses
+    /// this so callers already working in the projected plane (roads,
+    /// buildings, tiles) can test scope membership without maintaining a
+    /// second, EN-native copy of `Scope`'s rect/route_strip matching logic.
+    pub fn unproject_raw(easting: f64, northing: f64) -> (f64, f64) {
+        tm_inverse(easting, northing)
+    }
+
     /// The reference point's projected easting/northing in metres -- what
     /// `manifest.json` records as `origin.e0`/`origin.n0`.
     pub fn origin_en(&self) -> (f64, f64) {

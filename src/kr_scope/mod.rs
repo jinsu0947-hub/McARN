@@ -45,12 +45,19 @@ impl Scope {
     /// every piece by that many metres before testing; pass `0.0` for
     /// roads/buildings (§4.1.2) and `STOP_SCOPE_TOLERANCE_M` for stops.
     ///
-    /// Not called yet: PROGRESS.md §7 item 1 only ports `kr_transit`'s scope
-    /// judgment (which needs `contains_for_route` below, not this). Wiring
-    /// L0/L1/L2 physical generation to scope is separate, later work.
-    #[allow(dead_code)]
     pub fn contains(&self, lat: f64, lon: f64, tolerance_m: f64) -> bool {
         self.pieces.iter().any(|p| p.contains(lat, lon, tolerance_m))
+    }
+
+    /// [`Self::contains`] for a caller already in EPSG:5186 easting/northing
+    /// metres (roads, buildings, tiles) instead of lat/lon -- unprojects
+    /// once and reuses `contains` so Rect/RouteStrip matching never
+    /// diverges between the two coordinate systems. The extra trig is
+    /// negligible at the call granularity every user of this (one test per
+    /// road link, per building, per tile) actually needs.
+    pub fn contains_en(&self, e: f64, n: f64, tolerance_m: f64) -> bool {
+        let (lat, lon) = KoreaTmProjection::unproject_raw(e, n);
+        self.contains(lat, lon, tolerance_m)
     }
 
     /// The scope that decides whether `route_id` itself, or one of its
@@ -176,6 +183,17 @@ mod tests {
         assert!(scope.contains(just_outside.0, just_outside.1, STOP_SCOPE_TOLERANCE_M));
         let far_outside = (35.150, 129.200);
         assert!(!scope.contains(far_outside.0, far_outside.1, STOP_SCOPE_TOLERANCE_M));
+    }
+
+    #[test]
+    fn contains_en_round_trips_through_projection_and_agrees_with_contains() {
+        let scope = Scope::new(vec![yeongdo_rect()]);
+        let (lat, lon) = (35.077, 129.0455); // inside, per rect_includes... above
+        let (e, n) = KoreaTmProjection::project_raw(lat, lon);
+        assert!(scope.contains_en(e, n, 0.0));
+        let (lat, lon) = (35.150, 129.200); // far outside
+        let (e, n) = KoreaTmProjection::project_raw(lat, lon);
+        assert!(!scope.contains_en(e, n, 0.0));
     }
 
     #[test]

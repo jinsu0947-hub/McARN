@@ -81,12 +81,8 @@ use std::path::Path;
 /// SPEC_RoadSection.md §5's own three-way split.
 const OMIT_BELOW_RATIO: f64 = 0.30;
 const WARN_BELOW_RATIO: f64 = 0.70;
-/// SPEC_GenerationScope.md §6.
+/// SPEC_Scope_v0.2.md §6.
 const HIGHRISE_FLOORS: u32 = 15;
-/// SPEC_GenerationScope.md §6 (reused from `kr_transit`, which already
-/// declares this constant but has no consumer for it yet -- this module is
-/// that consumer).
-const BUILDING_BUFFER_M: f64 = crate::kr_transit::BUILDING_BUFFER_M;
 
 /// SPEC_BuildingType.md §3's five named groups plus the spec's own catch-all
 /// (`X`: "그 외 주용도... O 규칙을 따르되 지붕만 별도 처리한다").
@@ -391,6 +387,10 @@ pub struct KrBuildingsReport {
     pub omitted_road_overlap: usize,
     pub clipped_road_overlap: usize,
     pub l3_simplified: usize,
+    /// Low-rise, outside L2 scope -- `SPEC_Scope §2`'s "L3는 15층 이상만"
+    /// leaves nothing to place it as. New in the scope-generalization pass
+    /// (`PROGRESS.md §7`); `0` whenever `scope` is `None`.
+    pub omitted_out_of_scope: usize,
 }
 
 /// Converts a building's outer ring (EN metres) to block coordinates and
@@ -455,9 +455,9 @@ fn nearest_front(
 /// SPEC_Build.md M4's compute phase: load, classify, clip, and resolve a
 /// front elevation for every building in this run's bbox -- plain data, no
 /// `WorldEditor`, exactly mirroring `kr_roads::compute_kr_road_network`.
-/// `route_polylines` is `kr_transit`'s already-built route centerlines
-/// (`None` when M2 wasn't run this invocation, in which case every building
-/// gets L2 detail -- see the module doc's disclosed L2/L3 simplification).
+/// `scope` is `kr_transit`'s already-resolved `Scope` (`None` when M2 wasn't
+/// run this invocation, in which case every building gets L2 detail --
+/// `SPEC_Scope §5.2`'s no-preset default, applied per-building here).
 #[allow(clippy::too_many_arguments)]
 pub fn compute_kr_buildings(
     ground: &Ground,
@@ -467,17 +467,16 @@ pub fn compute_kr_buildings(
     shp_path: &Path,
     dbf_path: &Path,
     road_network: &KrRoadNetwork,
-    route_polylines: Option<&HashMap<String, Vec<[i32; 2]>>>,
+    scope: Option<&crate::kr_scope::Scope>,
 ) -> Result<(Vec<PlannedBuilding>, KrBuildingsReport), String> {
     let en_bbox = (planar.e_min(), planar.n_min(), planar.e_max(), planar.n_max());
     let raw = load_raw(shp_path, dbf_path, en_bbox)?;
-
-    let l2_buffer_blocks = BUILDING_BUFFER_M * scale;
 
     let mut planned = Vec::with_capacity(raw.len());
     let mut omitted_road_overlap = 0usize;
     let mut clipped_road_overlap = 0usize;
     let mut l3_simplified = 0usize;
+    let mut omitted_out_of_scope = 0usize;
     let mut delta_samples: Vec<i32> = Vec::new();
 
     for rec in &raw {
@@ -566,15 +565,22 @@ pub fn compute_kr_buildings(
         };
 
         let is_highrise = rec.floors_above >= HIGHRISE_FLOORS;
-        let near_route = route_polylines
-            .map(|polylines| {
-                polylines.values().any(|pts| {
-                    let xz: Vec<(i32, i32)> = pts.iter().map(|p| (p[0], p[1])).collect();
-                    geom::point_polyline_distance(centroid, &xz) <= l2_buffer_blocks
-                })
+        // SPEC_Scope §2: "L2 건물 = scope 내 전부", center-point judged (§3).
+        // No scope this run (no bus/preset data) -> everything is L2, same
+        // fallback the old route_polylines-based test used.
+        let in_scope = scope
+            .map(|s| {
+                let (ce, cn) = kr_roads::block_to_en(centroid.0, centroid.1, planar, scale);
+                s.contains_en(ce, cn, 0.0)
             })
-            .unwrap_or(true); // no M2 route data this run -> everything is L2 (see module doc)
-        let detail_level = if is_highrise && !near_route { DetailLevel::L3 } else { DetailLevel::L2 };
+            .unwrap_or(true);
+        if !in_scope && !is_highrise {
+            // SPEC_Scope §2: L3 only takes highrises. A low-rise building
+            // outside L2 scope has no tier to land in at all.
+            omitted_out_of_scope += 1;
+            continue;
+        }
+        let detail_level = if in_scope { DetailLevel::L2 } else { DetailLevel::L3 };
         if detail_level == DetailLevel::L3 {
             l3_simplified += 1;
         }
@@ -606,6 +612,7 @@ pub fn compute_kr_buildings(
         omitted_road_overlap,
         clipped_road_overlap,
         l3_simplified,
+        omitted_out_of_scope,
     };
     Ok((planned, report))
 }

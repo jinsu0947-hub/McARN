@@ -891,6 +891,59 @@ pub fn generate_world_with_options(
         (sx >> 9, sz >> 9)
     });
 
+    // SPEC_Build.md M2 "정류소 좌표 배치" + scope resolution: solved once,
+    // here, *before* M1's road network -- `kr_transit::build_m2` needs
+    // nothing from `kr_road_network` (it reads 표준노드링크 directly for its
+    // own routing graph, `kr_roads::routing::RoadGraph::load`), but M1 now
+    // needs the `Scope` this produces to filter its own links (`SPEC_Scope
+    // §2` L1), so scope resolution has to come first. Only runs when both
+    // `--kr-bus-stops-dir` and `--kr-bus-routes-csv` are given; omitting
+    // either keeps M0/M1 behaviour completely unchanged (no `stops.json`, no
+    // scope-based tile/road/building filtering) -- existing runs, KR or
+    // otherwise, are unaffected by this flag's mere existence.
+    // `kr_stops_doc` is kept (not just used here for stops.json/tile scoping)
+    // for SPEC_Build.md M5 §3's bus-stop placement -- see
+    // `kr_street_furniture::place_bus_stops`'s own doc for why real stop
+    // coordinates, not `furniture_column`'s generic curb-side column, drive
+    // where those go.
+    // SPEC_Scope_v0.2.md §7 "영도 프리셋 예시" -- the only preset this
+    // pipeline knows so far (PROGRESS.md §7 item 1). Swapping this for a
+    // different region's pieces, or an actual preset-file loader, is the
+    // only change a future region needs here; `kr_transit` itself no longer
+    // knows what "Yeongdo" or "508" mean.
+    let kr_scope_pieces = crate::kr_scope::presets::yeongdo();
+
+    let (kr_scope, kr_stops_doc): (Option<Arc<crate::kr_scope::Scope>>, Option<Arc<crate::kr_transit::StopsDocument>>) =
+        if args.input_source == crate::args::InputSource::Kr {
+            if let (Some(bus_stops_dir), Some(bus_routes_csv)) = (&args.kr_bus_stops_dir, &args.kr_bus_routes_csv) {
+                let planar = args
+                    .korea_planar_bbox
+                    .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
+                let roads_dir = args.kr_roads_dir.as_ref().expect(
+                    "validate_args requires --kr-roads-dir alongside --kr-bus-stops-dir/--kr-bus-routes-csv \
+                     (M2's route polylines route through M1's own 표준노드링크 graph)",
+                );
+                match crate::kr_transit::build_m2(bus_stops_dir, bus_routes_csv, roads_dir, &planar, args.scale, &kr_scope_pieces) {
+                    Ok((doc, reports, scope)) => {
+                        crate::kr_transit::print_route_report(&reports);
+                        let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
+                        if let Err(e) = crate::kr_transit::write_stops_json(&graph_output_dir, &doc) {
+                            eprintln!("Warning: KR transit: failed to write stops.json: {e}");
+                        }
+                        (Some(Arc::new(scope)), Some(Arc::new(doc)))
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: KR transit (M2) failed: {e}");
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
     // SPEC_Build.md M1 / SPEC_Ingest.md §6 step 5 ("도로 종단선형"): solved
     // once, here, before the tile loop -- see `kr_roads`'s module doc for why
     // the network solve (needs only `Ground`, never evicted) and block
@@ -909,6 +962,7 @@ pub fn generate_world_with_options(
                     &planar,
                     args.scale,
                     roads_dir,
+                    kr_scope.as_deref(),
                 )
                 .map_err(|e| format!("KR roads: {e}"))?;
                 println!(
@@ -938,61 +992,6 @@ pub fn generate_world_with_options(
             None
         };
 
-    // SPEC_Build.md M2 "정류소 좌표 배치" / "생성 대상 청크 목록": solved
-    // once, here, alongside the M1 road network -- see `kr_transit`'s module
-    // doc. Only runs when both `--kr-bus-stops-dir` and `--kr-bus-routes-csv`
-    // are given; omitting either keeps M0/M1 behaviour completely unchanged
-    // (no `stops.json`, no buffer-based tile scoping) -- existing runs, KR
-    // or otherwise, are unaffected by this flag's mere existence.
-    // `kr_stops_doc` is kept (not just used here for stops.json/tile scoping)
-    // for SPEC_Build.md M5 §3's bus-stop placement -- see
-    // `kr_street_furniture::place_bus_stops`'s own doc for why real stop
-    // coordinates, not `furniture_column`'s generic curb-side column, drive
-    // where those go.
-    // SPEC_Scope_v0.2.md §7 "영도 프리셋 예시" -- the only preset this
-    // pipeline knows so far (PROGRESS.md §7 item 1). Swapping this for a
-    // different region's pieces, or an actual preset-file loader, is the
-    // only change a future region needs here; `kr_transit` itself no longer
-    // knows what "Yeongdo" or "508" mean.
-    let kr_scope_pieces = crate::kr_scope::presets::yeongdo();
-
-    let (kr_buffer_tiles, kr_stops_doc): (Option<HashSet<(i32, i32)>>, Option<Arc<crate::kr_transit::StopsDocument>>) =
-        if args.input_source == crate::args::InputSource::Kr {
-            if let (Some(bus_stops_dir), Some(bus_routes_csv)) = (&args.kr_bus_stops_dir, &args.kr_bus_routes_csv) {
-                let planar = args
-                    .korea_planar_bbox
-                    .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
-                let roads_dir = args.kr_roads_dir.as_ref().expect(
-                    "validate_args requires --kr-roads-dir alongside --kr-bus-stops-dir/--kr-bus-routes-csv \
-                     (M2's route polylines route through M1's own 표준노드링크 graph)",
-                );
-                match crate::kr_transit::build_m2(bus_stops_dir, bus_routes_csv, roads_dir, &planar, args.scale, &kr_scope_pieces) {
-                    Ok((doc, reports, chunks)) => {
-                        crate::kr_transit::print_route_report(&reports);
-                        let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
-                        if let Err(e) = crate::kr_transit::write_stops_json(&graph_output_dir, &doc) {
-                            eprintln!("Warning: KR transit: failed to write stops.json: {e}");
-                        }
-                        // Chunk (16-block) -> tile (512-block, `tile::DEFAULT_TILE_SIZE`)
-                        // granularity: `create_tiles` and the tile loop below only ever
-                        // skip or keep a whole tile, never part of one.
-                        let buffer_tiles: HashSet<(i32, i32)> =
-                            chunks.into_iter().map(|(cx, cz)| (cx.div_euclid(32), cz.div_euclid(32))).collect();
-                        println!("KR transit: L0 buffer covers {} tile(s) of 512 blocks each", buffer_tiles.len());
-                        (Some(buffer_tiles), Some(Arc::new(doc)))
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: KR transit (M2) failed: {e}");
-                        (None, None)
-                    }
-                }
-            } else {
-                (None, None)
-            }
-        } else {
-            (None, None)
-        };
-
     // SPEC_Build.md M4 "건물": solved once, here, after M1's road network --
     // see `kr_buildings`' module doc. Needs `--kr-buildings-shp` and
     // `--kr-roads-dir` (footprints are clipped against M1's already-solved
@@ -1005,26 +1004,6 @@ pub fn generate_world_with_options(
                     .korea_planar_bbox
                     .expect("validate_args requires --bbox/--bbox-en for --input-source kr");
                 let dbf_path = shp_path.with_extension("dbf");
-                // L2/L3 (SPEC_GenerationScope.md §2) keys off the bus-route
-                // centerlines M2 already builds for the terrain buffer --
-                // recomputed here rather than threaded out of `build_m2`
-                // (small, and keeps that function's own signature/callers
-                // untouched). `None` when M2 wasn't run this invocation, in
-                // which case `kr_buildings` itself treats every building as
-                // L2 -- see that module's doc for why that's the right
-                // fallback, not a silent bug.
-                let route_polylines = if let (Some(bus_stops_dir), Some(bus_routes_csv)) =
-                    (&args.kr_bus_stops_dir, &args.kr_bus_routes_csv)
-                {
-                    crate::kr_transit::build_stops_document(bus_stops_dir, bus_routes_csv, &planar, args.scale, &kr_scope_pieces)
-                        .ok()
-                        .and_then(|(mut doc, _)| {
-                            let roads_dir = args.kr_roads_dir.as_ref()?;
-                            crate::kr_transit::build_route_polylines(&mut doc, roads_dir, &planar, args.scale).ok()
-                        })
-                } else {
-                    None
-                };
                 match crate::kr_buildings::compute_kr_buildings(
                     ground.as_ref(),
                     &xzbbox,
@@ -1033,17 +1012,18 @@ pub fn generate_world_with_options(
                     shp_path,
                     &dbf_path,
                     network,
-                    route_polylines.as_ref(),
+                    kr_scope.as_deref(),
                 ) {
                     Ok((buildings, report)) => {
                         println!(
                             "KR buildings: {} loaded, {} placed, {} omitted (road overlap <30%), \
-                             {} clipped (road overlap), {} simplified to L3",
+                             {} clipped (road overlap), {} simplified to L3, {} omitted (out of scope, low-rise)",
                             report.loaded,
                             report.placed,
                             report.omitted_road_overlap,
                             report.clipped_road_overlap,
-                            report.l3_simplified
+                            report.l3_simplified,
+                            report.omitted_out_of_scope
                         );
                         let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
                         if let Err(e) = crate::kr_buildings::write_buildings_json(&graph_output_dir, &buildings) {
@@ -1066,15 +1046,24 @@ pub fn generate_world_with_options(
     // Decide between sequential and parallel processing based on world size.
     // Tile subdivision is aligned to 512-block Minecraft region boundaries.
     let tiles = tile::create_tiles(&xzbbox, tile::DEFAULT_TILE_SIZE);
-    // SPEC_GenerationScope.md §0: "띠 밖 청크는 ... 아예 생성하지 않는다" --
-    // drop every tile the M2 buffer doesn't reach *before* the parallel-vs-
-    // sequential decision and element assignment below, so nothing (not even
-    // an empty WorldEditor) is ever created for it. `None` (the flag wasn't
-    // given, or M2 failed) leaves every tile in place -- unchanged behaviour.
-    let tiles: Vec<tile::TileBounds> = if let Some(buffer_tiles) = &kr_buffer_tiles {
+    // SPEC_Scope_v0.2.md §2: "L0 지형 = scope + TERRAIN_BUFFER" -- drop every
+    // tile whose centre falls outside that (tested in EN metres, tolerance
+    // `TERRAIN_BUFFER_M`) *before* the parallel-vs-sequential decision and
+    // element assignment below, so nothing (not even an empty `WorldEditor`)
+    // is ever created for it. `None` (no scope this run) leaves every tile
+    // in place -- unchanged behaviour, `SPEC_Scope §5.2`'s no-preset default.
+    let tiles: Vec<tile::TileBounds> = if let Some(scope) = &kr_scope {
+        let planar = args.korea_planar_bbox.expect("validate_args requires --bbox/--bbox-en for --input-source kr");
         let before = tiles.len();
-        let kept: Vec<_> = tiles.into_iter().filter(|t| buffer_tiles.contains(&(t.min_x >> 9, t.min_z >> 9))).collect();
-        println!("KR transit: buffer scoping kept {}/{before} tile(s)", kept.len());
+        let kept: Vec<_> = tiles
+            .into_iter()
+            .filter(|t| {
+                let (cx, cz) = ((t.min_x + t.max_x) as f64 / 2.0, (t.min_z + t.max_z) as f64 / 2.0);
+                let (e, n) = crate::kr_roads::block_to_en(cx, cz, &planar, args.scale);
+                scope.contains_en(e, n, crate::kr_transit::TERRAIN_BUFFER_M)
+            })
+            .collect();
+        println!("KR scope: L0 terrain buffer kept {}/{before} tile(s)", kept.len());
         kept
     } else {
         tiles

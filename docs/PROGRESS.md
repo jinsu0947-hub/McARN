@@ -8,11 +8,18 @@
 
 **2026-09-18 상태:**
 
-1. uncommitted 횡단보도/정지선 코드 → 빌드 검증 → 커밋 `691c0596` → push. `git status` clean.
+1. uncommitted 횡단보도/정지선 코드 → 빌드 검증 → 커밋 `691c0596` → push.
 2. 일반화 설계를 명세로 확정 (`SPEC_Scope_v0.2.md`, `SPEC_Validation_v0.1.md` 신규 + 7개 문서 수정) → 커밋 `77890c3c` → push.
-3. **§7 item 1 완료 — `kr_transit`의 영도 하드코딩을 scope 판정으로 교체.** `PRIMARY_ROUTE`/`YEONGDO_LON_MIN/MAX`/`YEONGDO_LAT_MIN/MAX`/`is_in_yeongdo_range`를 전부 제거하고 새 `src/kr_scope/mod.rs`(`Scope`/`ScopePiece`, `SPEC_Scope_v0.2.md §1-§4` 구현)로 교체했다. 구현 중 실측으로 scope 설계를 한 번 더 다듬었다 — route_strip 조각을 전역 판정에 썼더니 508이 지나는 도심 환승 거점(남포동·중앙동·초량·부산역)을 스치는 무관한 노선까지 20→51개로 딸려왔다. `SPEC_Scope §4.1.1` "조각의 두 역할"로 해소: 영역 조각(rect/admin_polygon)은 전체 노선 판정에 쓰이고, 노선 조각(route_strip)은 자기 노선만 self-qualify한다(`Scope::contains_for_route`). **검증 완료** — 영도 사각형 ∪ 508 띠로 실데이터를 돌려 리팩터 전 baseline과 대조, 정규화 후 완전 일치(diff 0, 20개 노선·161개 정류소 동일). 커밋 `e456c168`, **push는 아직 안 함**.
+3. **§7 item 1 완료 — `kr_transit`의 영도 하드코딩을 scope 판정으로 교체**, 커밋 `e456c168`, `cc296ba6` → push. 실측 검증 중 `SPEC_Scope §4.1.1` "조각의 두 역할"(route_strip은 자기 노선만 self-qualify)을 추가로 확정했다 — 자세한 내용은 이 절 바로 아래 대신 §7 item 1 본문 참고.
+4. **`Scope::contains_en`을 L0-L2 물리 생성 범위에 연결했다** (item 1이 남겼던 것). `SPEC_Scope §2`:
+   - L0 (지형 타일): `data_processing.rs`의 타일 필터링이 옛 route-polyline 버퍼 대신 `scope.contains_en(타일 중심, TERRAIN_BUFFER_M)`을 쓴다.
+   - L1 (도로): `kr_roads::clip()`이 bbox 클립에 더해 `scope.contains_en(링크의 아무 점, STUB_LENGTH_M)` 필터를 추가로 건다 — 스텁은 **온전한 링크를 그대로 살리는 근사**다(정확한 중간 절단+지형 테이퍼는 안 함, `SPEC_RoadProfile P8` 미연결 상태 그대로).
+   - L2/L3 (건물): `kr_buildings::compute_kr_buildings`가 옛 `BUILDING_BUFFER_M`+`route_polylines` 근접 거리 판정 대신 `scope.contains_en(중심점, 0.0)`을 직접 쓴다. **동작이 바뀐 지점**: scope 밖 + 저층인 건물은 이제 **아예 생략**된다(전엔 전부 생성했다) — `KrBuildingsReport.omitted_out_of_scope`로 집계.
+   - `data_processing.rs`의 M2/M1/M4 순서를 재배치했다 — `kr_transit::build_m2`(scope 산출)가 M1(`kr_roads`)보다 먼저 실행되어야 L1이 그 `Scope`를 받을 수 있다. 의존 방향 확인됨 (M2는 M1의 `KrRoadNetwork`를 쓰지 않는다, 자기만의 라우팅 그래프를 따로 읽는다).
+   - `kr_roads::block_to_en` (`en_to_block`의 역함수), `KoreaTmProjection::unproject_raw`, `Scope::contains_en` 추가.
+   - **검증**: 단위 테스트로 `kr_scope`(7개, EN 왕복 포함)와 `kr_roads::clip()`(scope 포함/제외 양쪽, 합성 fixture) 직접 검증 + `kr_transit`의 실데이터 M2 테스트가 여전히 baseline과 byte-identical. **전체 바이너리 실행(`arnis.exe`)으로 실제 Anvil 월드를 생성해 사각형/508 구간을 블록 단위로 비교하는 것은 하지 않았다** — 이건 plan/compute 단계 검증이지, 사용자가 요청한 "실행" 단계 검증이 아니다. 아직 커밋 안 함.
 
-**다음 세션이 할 일** — `e456c168` push 여부 확인 먼저. 그다음 §7의 나머지 항목: 2번(교량 프리셋 파일 읽기), 4번(`SCALE` 파라미터화, 1번과 맞물려 있음). `Scope::contains`(전역 물리 scope, L0-L3)는 아직 아무 데도 안 붙어 있다 — 지형/도로/건물 생성 범위를 scope에 연결하는 건 이번에 하지 않았다.
+**다음 세션(또는 이 세션 재개)이 할 일** — 4번 작업물 커밋 여부/전체 바이너리 실행 검증 필요 여부 확인. §7의 나머지: 2번(교량 프리셋 파일 읽기), 5번(`SCALE` 파라미터화, 1번/4번과 맞물려 있음).
 
 **빌드 전 메모리 확인은 여전히 유효하다.**
 
