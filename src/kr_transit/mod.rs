@@ -8,61 +8,81 @@
 //! 방법(`method`)과 신뢰도(`confidence`)를 남긴다 -- 나중에 실제 크로스워크
 //! 자료가 생기면 그 정류소의 `pos`/`match`만 갈아 끼우면 되도록.
 //!
-//! **대상 노선 판정**: SPEC_GenerationScope.md §1.1의 주 노선(508)은 항상
-//! 포함한다. 그 외 노선은 매칭된 정류소 중 하나라도 [`is_in_yeongdo_range`]
-//! 범위에 들면 포함한다 -- 구/동 필드가 어디에도 없어 좌표 범위가 유일하게
-//! 가진 판정 신호다 (해당 함수 문서 참고).
+//! **대상 노선 판정과 절단 규칙**: `SPEC_Scope_v0.2.md §4.1`로 통일됐다 --
+//! 노선이든 정류소든 "scope 안인가" 하나로만 묻는다. 이 모듈은 더 이상
+//! 지역을 하드코딩하지 않는다; 호출부가 [`kr_scope::ScopePieceInput`]의
+//! 목록(예: [`kr_scope::presets::yeongdo`])을 넘기면 [`resolve_scope_pieces`]가
+//! 그걸 실제 [`kr_scope::Scope`]로 바꾸고, [`kr_scope::Scope::contains_for_route`]
+//! 하나로 노선 채택·정류소 절단을 전부 판정한다. 예전의 "508(주 노선)은
+//! 항상 전 구간 유지" 특례는 이제 코드 분기가 아니라 **508을 route_strip
+//! scope 조각으로 넣은 프리셋의 자연스러운 결과**다 -- route_strip은 자기
+//! 자신의 정류소 순서로 만든 폴리라인이라, 그 노선의 모든 정류소는 자기
+//! 폴리라인의 정점이므로 거리 0으로 항상 scope 안이다.
 //!
-//! **절단 규칙** (SPEC_GenerationScope.md §1.1, 2026-09-13 개정): 508은
-//! 매칭된 정류소를 전부 유지한다. 그 외 대상 노선은 [`is_in_yeongdo_range`]
-//! 범위 밖으로 나가는 정류소를 잘라낸다 -- 다리를 건넌 이후 구간이라는
-//! 뜻이다. 잘라낸 정류소는 `routes[].stops`에서만 빠진다; 다른 노선(주로
-//! 508)이 여전히 참조하면 `stops[]` 전역 목록에는 남는다.
+//! **`contains`가 아니라 `contains_for_route`를 쓰는 이유** (`SPEC_Scope
+//! §4.1.1` "조각의 두 역할"): route_strip을 모든 노선에 똑같이 적용되는
+//! 전역 판정(`contains`)에 썼더니, 508이 지나는 도심 환승 거점을 스치기만
+//! 하는 무관한 노선까지 전부 채택돼 영도 프리셋 검증에서 노선 수가
+//! 20 -> 51개로 늘었다 (2026-09-18 실측, `PROGRESS.md §7` item 1). route_strip
+//! 조각은 **자기 노선 자신의 판정에만** 관여해야 한다 -- 지형·도로·건물
+//! 생성 범위(어딘가 이 파이프라인이 `contains`를 직접 쓰게 될 부분)는
+//! 여전히 route_strip을 포함한 전 조각의 합집합을 쓴다; 노선/정류소
+//! 채택만 예외다.
+//!
+//! 정류소 판정에는 `kr_scope::STOP_SCOPE_TOLERANCE_M`만큼 경계 여유를 둔다
+//! (`SPEC_Scope §4.1.2`) -- 노선 채택 판정과 절단 판정 둘 다 여기에 건다.
+//! 잘라낸 정류소는 `routes[].stops`에서만 빠진다; 다른 노선(주로 508)이
+//! 여전히 참조하면 `stops[]` 전역 목록에는 남는다.
 //!
 //! `y2`(지형고도)와 `shelter`(승차대 유무)는 이 단계에서 낼 수 없다 --
 //! 전자는 `Ground`가, 후자는 M5 가로 요소 자료가 필요한데 둘 다 이 매칭
 //! 단계에는 없다. `null`로 남겨 "0"을 실제 값으로 오인하지 않게 한다.
 
 use crate::kr_bus_routes::load_route_stops;
-use crate::kr_bus_stops::load_bus_stops;
 use crate::kr_bus_stops::matching::{self, Confidence, RouteMatchResult, UnplacedReason};
-use crate::projection::korea_tm::KoreaPlanarBBox;
+use crate::kr_bus_stops::{load_bus_stops, BusStop};
+use crate::kr_scope::{Scope, ScopePiece, ScopePieceInput, STOP_SCOPE_TOLERANCE_M};
+use crate::projection::korea_tm::{KoreaPlanarBBox, KoreaTmProjection};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-/// SPEC_GenerationScope.md §1.1's 주 노선 -- always included, never truncated.
-pub const PRIMARY_ROUTE: &str = "508";
-
-const YEONGDO_LON_MIN: f64 = 129.037;
-const YEONGDO_LON_MAX: f64 = 129.090;
-const YEONGDO_LAT_MIN: f64 = 35.060;
-const YEONGDO_LAT_MAX: f64 = 35.100;
-
-/// A coordinate rectangle standing in for "영도구" -- there is no
-/// administrative-boundary polygon in this pipeline, and the bus stop SHP
-/// carries no 구/동 field either (confirmed by inspecting its actual
-/// fields), so a coordinate range is the only signal available.
+/// Turns a preset's [`ScopePieceInput`]s into real geometry. A `RouteStrip`
+/// needs a route's own matched-stop sequence to become a polyline, which
+/// only exists after Pass 1 matching runs -- hence the extra `all_results`/
+/// `stops` arguments this can't get from `ScopePieceInput` alone.
 ///
-/// Derived from the real data, not guessed: `arsno`'s first two digits are
-/// Busan's bus-stop ARS region code, and `04` was cross-validated earlier
-/// against unambiguous Yeongdo landmarks (대교동, 남항동, 동삼동, 고신대학,
-/// HJ중공업, 국립해양박물관, 한국해양대 ...). Every `arsno`-`04` stop falls
-/// in lon [129.037257, 129.081256], lat [35.063414, 35.099485]; this range
-/// pads that envelope slightly (to cover a few real Yeongdo stops just
-/// outside it, e.g. 한국해양대 해사대학관 at lon 129.0887) while staying
-/// clear of the nearest confirmed mainland cluster (자갈치역·남포동·
-/// 충무동교차로·부평시장, all lon <= 129.0298).
-///
-/// **Known limit**: the two bridgeheads (영도대교/부산대교 남포동·중앙동
-/// 쪽 접속부) sit only ~100-300m from this range's own edge, closer than
-/// the padding above -- a stop right at a bridge approach can land on
-/// either side of the line. This is exactly the ambiguity
-/// SPEC_GenerationScope.md §1.1 now discloses for the truncation rule: at
-/// most one stop of error at the cut point, not a systematic
-/// misclassification of interior stops.
-pub fn is_in_yeongdo_range(lat: f64, lon: f64) -> bool {
-    (YEONGDO_LAT_MIN..=YEONGDO_LAT_MAX).contains(&lat) && (YEONGDO_LON_MIN..=YEONGDO_LON_MAX).contains(&lon)
+/// A route id a preset names but this run's CSV doesn't have (wrong CSV,
+/// route renamed, etc.) is skipped with a warning, not treated as fatal --
+/// one missing piece shouldn't abort a run when the scope's other pieces
+/// (typically a rect) still define something usable.
+fn resolve_scope_pieces(
+    inputs: &[ScopePieceInput],
+    all_results: &HashMap<&str, RouteMatchResult>,
+    stops: &HashMap<u64, BusStop>,
+) -> Scope {
+    let mut pieces = Vec::with_capacity(inputs.len());
+    for input in inputs {
+        match input {
+            ScopePieceInput::Rect { lat_min, lon_min, lat_max, lon_max } => {
+                pieces.push(ScopePiece::Rect { lat_min: *lat_min, lon_min: *lon_min, lat_max: *lat_max, lon_max: *lon_max });
+            }
+            ScopePieceInput::RouteStrip { route_id, buffer_m } => {
+                let Some(result) = all_results.get(route_id.as_str()) else {
+                    eprintln!("Warning: KR transit: scope preset references route {route_id}, not found in this run's route CSV -- piece skipped");
+                    continue;
+                };
+                let points_en: Vec<(f64, f64)> =
+                    result.matched.iter().map(|m| KoreaTmProjection::project_raw(stops[&m.bstopid].lat, stops[&m.bstopid].lon)).collect();
+                if points_en.is_empty() {
+                    eprintln!("Warning: KR transit: scope preset's route {route_id} matched no stops -- route_strip piece skipped");
+                    continue;
+                }
+                pieces.push(ScopePiece::RouteStrip { route_id: route_id.clone(), points_en, buffer_m: *buffer_m });
+            }
+        }
+    }
+    Scope::new(pieces)
 }
 
 #[derive(Serialize)]
@@ -171,15 +191,17 @@ fn reason_str(r: UnplacedReason) -> &'static str {
 }
 
 /// Loads both datasets, matches **every** route in the CSV once (needed to
-/// decide which ones qualify at all -- see the module doc), selects 508 plus
-/// every route touching [`is_in_yeongdo_range`], applies the truncation rule
-/// to the non-508 selections, and builds the `stops.json` document plus a
-/// per-route report.
+/// resolve `scope_pieces`' route_strip pieces and to know which routes
+/// qualify at all -- see the module doc), selects every route touching
+/// `scope` (`STOP_SCOPE_TOLERANCE_M` slack, `SPEC_Scope §4.1.1`), applies the
+/// truncation rule, and builds the `stops.json` document plus a per-route
+/// report.
 pub fn build_stops_document(
     bus_stops_dir: &Path,
     route_csv: &Path,
     planar: &KoreaPlanarBBox,
     scale: f64,
+    scope_pieces: &[ScopePieceInput],
 ) -> Result<(StopsDocument, Vec<RouteReport>), String> {
     let stops = load_bus_stops(bus_stops_dir, planar, scale)?;
     let route_data = load_route_stops(route_csv)?;
@@ -195,37 +217,35 @@ pub fn build_stops_document(
     let mut route_names: Vec<&String> = route_data.stops_by_route.keys().collect();
     route_names.sort();
 
-    // Pass 1: every route has to be matched before we know which ones even
-    // touch Yeongdo -- the qualification test needs real coordinates.
+    // Pass 1: every route has to be matched before scope can even be
+    // resolved -- a route_strip piece needs a route's own matched-stop
+    // polyline, and the qualification test needs real coordinates.
     let mut all_results: HashMap<&str, RouteMatchResult> = HashMap::with_capacity(route_names.len());
     for &route_no in &route_names {
         let route_stops = &route_data.stops_by_route[route_no];
         all_results.insert(route_no.as_str(), matching::match_route(route_stops, &name_index, &stops));
     }
 
+    let scope = resolve_scope_pieces(scope_pieces, &all_results, &stops);
+
     let mut target_routes: Vec<&str> = route_names
         .iter()
         .map(|s| s.as_str())
         .filter(|&route_no| {
-            route_no == PRIMARY_ROUTE
-                || all_results[route_no].matched.iter().any(|m| {
-                    // A substring-fallback match is a guess (see
-                    // `matching::StopNameIndex::candidates_for`), not
-                    // evidence a route actually reaches Yeongdo -- one bad
-                    // guess must not pull an unrelated, otherwise-mainland
-                    // route into scope. Route-order geometry still uses
-                    // these matches (they can end up in `stops.json`), just
-                    // not as the signal that qualifies the whole route.
-                    !m.via_substring && is_in_yeongdo_range(stops[&m.bstopid].lat, stops[&m.bstopid].lon)
-                })
+            all_results[route_no].matched.iter().any(|m| {
+                // A substring-fallback match is a guess (see
+                // `matching::StopNameIndex::candidates_for`), not evidence a
+                // route actually reaches the scope -- one bad guess must not
+                // pull an unrelated, out-of-scope route into the result.
+                // Route-order geometry still uses these matches (they can
+                // end up in `stops.json`), just not as the signal that
+                // qualifies the whole route.
+                !m.via_substring && scope.contains_for_route(route_no, stops[&m.bstopid].lat, stops[&m.bstopid].lon, STOP_SCOPE_TOLERANCE_M)
+            })
         })
         .collect();
     target_routes.sort();
-    println!(
-        "KR transit: {} of {} routes qualify (508 + coordinate-based Yeongdo match)",
-        target_routes.len(),
-        route_names.len()
-    );
+    println!("KR transit: {} of {} routes qualify (scope match)", target_routes.len(), route_names.len());
 
     let mut stop_entries: HashMap<u64, (HashSet<String>, StopMatchInfo)> = HashMap::new();
     let mut route_entries = Vec::new();
@@ -245,12 +265,17 @@ pub fn build_stops_document(
             }
         }
 
-        let keep_all = route_no == PRIMARY_ROUTE;
         let mut route_stop_ids = Vec::new();
         let mut cut = 0usize;
         for m in &result.matched {
             let s = &stops[&m.bstopid];
-            if !keep_all && !is_in_yeongdo_range(s.lat, s.lon) {
+            // No `route_no == "508"` special case: a route_strip piece
+            // built from a route's own matched stops (§ module doc) keeps
+            // every one of them automatically, since each is a vertex of
+            // its own polyline (distance 0, always within any buffer) --
+            // and `contains_for_route` only lets *this* route's own
+            // route_strip count, so it can't be widened by someone else's.
+            if !scope.contains_for_route(route_no, s.lat, s.lon, STOP_SCOPE_TOLERANCE_M) {
                 cut += 1;
                 continue;
             }
@@ -493,8 +518,9 @@ pub fn build_m2(
     moct_dir: &Path,
     planar: &KoreaPlanarBBox,
     scale: f64,
+    scope_pieces: &[ScopePieceInput],
 ) -> Result<(StopsDocument, Vec<RouteReport>, std::collections::HashSet<(i32, i32)>), String> {
-    let (mut doc, reports) = build_stops_document(bus_stops_dir, route_csv, planar, scale)?;
+    let (mut doc, reports) = build_stops_document(bus_stops_dir, route_csv, planar, scale, scope_pieces)?;
     let polylines = build_route_polylines(&mut doc, moct_dir, planar, scale)?;
     let buffer_blocks = (TERRAIN_BUFFER_M * scale).round() as i32;
     let chunks = buffer_chunks(&polylines, buffer_blocks);
@@ -544,29 +570,13 @@ pub fn print_route_report(reports: &[RouteReport]) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn yeongdo_range_excludes_the_confirmed_mainland_cluster() {
-        // 자갈치역.비프광장, 남포동, 충무동교차로, 부평시장 -- all confirmed
-        // mainland during the loading-session investigation.
-        assert!(!is_in_yeongdo_range(35.098124820320002, 129.029504173349011));
-        assert!(!is_in_yeongdo_range(35.098276349999999, 129.029738199999997));
-        assert!(!is_in_yeongdo_range(35.095626666699999, 129.024266666699987));
-        assert!(!is_in_yeongdo_range(35.101258333300002, 129.025168333300002));
-    }
-
-    #[test]
-    fn yeongdo_range_includes_confirmed_yeongdo_landmarks() {
-        // 대교동 (bridge connection point), 태종대초등학교 (south tip),
-        // 해양대구본관 (east end, Dongsam-dong causeway campus).
-        assert!(is_in_yeongdo_range(35.077, 129.0455)); // 대교동 vicinity, approximate
-        assert!(is_in_yeongdo_range(35.064896666700001, 129.081115000000011));
-        assert!(is_in_yeongdo_range(35.076531795698003, 129.087808534199013));
-    }
-
     /// Runs the real, gitignored source data (`data/`) end to end for every
-    /// route the coordinate-based Yeongdo test selects, and writes the
-    /// resulting `stops.json` next to this crate for review. Not run by a
-    /// plain `cargo test` (needs local-only data files); run explicitly with
+    /// route the Yeongdo preset (`kr_scope::presets::yeongdo`) scope-matches,
+    /// and writes the resulting `stops.json` next to this crate for review
+    /// -- and, separately, for diffing against the pre-refactor baseline
+    /// (`data/stops_review_BASELINE_pre_scope_refactor.json`,
+    /// PROGRESS.md §7 item 1's validation step). Not run by a plain `cargo
+    /// test` (needs local-only data files); run explicitly with
     /// `cargo test --offline kr_transit -- --ignored --nocapture` to see the
     /// full console report.
     #[test]
@@ -576,8 +586,9 @@ mod tests {
         let route_csv = Path::new("data/부산광역시_버스노선별 승하차 정보_20230731.csv");
         let moct_dir = Path::new("data/[2026-08-12]NODELINKDATA");
         let planar = KoreaPlanarBBox::new(0.0, 0.0, 1_000_000.0, 1_000_000.0).unwrap();
+        let scope_pieces = crate::kr_scope::presets::yeongdo();
 
-        let (doc, reports, chunks) = build_m2(bus_stops_dir, route_csv, moct_dir, &planar, 1.75).unwrap();
+        let (doc, reports, chunks) = build_m2(bus_stops_dir, route_csv, moct_dir, &planar, 1.75, &scope_pieces).unwrap();
 
         for r in &reports {
             assert_eq!(
@@ -590,7 +601,7 @@ mod tests {
         }
         assert!(!chunks.is_empty(), "the L0 buffer must cover at least one chunk");
         for route in &doc.routes {
-            if route.route_id == PRIMARY_ROUTE {
+            if route.route_id == "508" {
                 assert!(!route.links.is_empty(), "508 must have routed at least one road link");
             }
         }

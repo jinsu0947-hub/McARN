@@ -949,6 +949,13 @@ pub fn generate_world_with_options(
     // `kr_street_furniture::place_bus_stops`'s own doc for why real stop
     // coordinates, not `furniture_column`'s generic curb-side column, drive
     // where those go.
+    // SPEC_Scope_v0.2.md §7 "영도 프리셋 예시" -- the only preset this
+    // pipeline knows so far (PROGRESS.md §7 item 1). Swapping this for a
+    // different region's pieces, or an actual preset-file loader, is the
+    // only change a future region needs here; `kr_transit` itself no longer
+    // knows what "Yeongdo" or "508" mean.
+    let kr_scope_pieces = crate::kr_scope::presets::yeongdo();
+
     let (kr_buffer_tiles, kr_stops_doc): (Option<HashSet<(i32, i32)>>, Option<Arc<crate::kr_transit::StopsDocument>>) =
         if args.input_source == crate::args::InputSource::Kr {
             if let (Some(bus_stops_dir), Some(bus_routes_csv)) = (&args.kr_bus_stops_dir, &args.kr_bus_routes_csv) {
@@ -959,7 +966,7 @@ pub fn generate_world_with_options(
                     "validate_args requires --kr-roads-dir alongside --kr-bus-stops-dir/--kr-bus-routes-csv \
                      (M2's route polylines route through M1's own 표준노드링크 graph)",
                 );
-                match crate::kr_transit::build_m2(bus_stops_dir, bus_routes_csv, roads_dir, &planar, args.scale) {
+                match crate::kr_transit::build_m2(bus_stops_dir, bus_routes_csv, roads_dir, &planar, args.scale, &kr_scope_pieces) {
                     Ok((doc, reports, chunks)) => {
                         crate::kr_transit::print_route_report(&reports);
                         let graph_output_dir = output_path.parent().unwrap_or(&output_path).to_path_buf();
@@ -1009,7 +1016,7 @@ pub fn generate_world_with_options(
                 let route_polylines = if let (Some(bus_stops_dir), Some(bus_routes_csv)) =
                     (&args.kr_bus_stops_dir, &args.kr_bus_routes_csv)
                 {
-                    crate::kr_transit::build_stops_document(bus_stops_dir, bus_routes_csv, &planar, args.scale)
+                    crate::kr_transit::build_stops_document(bus_stops_dir, bus_routes_csv, &planar, args.scale, &kr_scope_pieces)
                         .ok()
                         .and_then(|(mut doc, _)| {
                             let roads_dir = args.kr_roads_dir.as_ref()?;
