@@ -6,12 +6,13 @@
 
 ## 0. 지금 당장 할 일
 
-**2026-09-18 상태 — 둘 다 이번 세션에서 처리됨:**
+**2026-09-18 상태:**
 
-1. §0(구판)이 말하던 uncommitted 횡단보도/정지선 코드는 여유 메모리 확인 후 debug 빌드로 컴파일 검증(최초 성공, 18분 50초) → 커밋 `691c0596` → push 완료. `git status` clean.
-2. **일반화 설계를 명세로만 확정했다. 코드는 아직 하나도 안 건드렸다.** 영도·508 전용으로 하드코딩됐던 scope·좌표계·수계·검증 설계를 지역 무관 구조로 다시 썼다 — 새 문서 `SPEC_Scope_v0.2.md`(구 `SPEC_GenerationScope_v0.1.md` 대체), `SPEC_Validation_v0.1.md`(신규), 그리고 `SPEC_Ingest`/`SPEC_RoadSection`/`SPEC_StreetFurniture`/`SPEC_BuildingType`/`SPEC_Bridge`/`SPEC_Build`/`SPEC_RoadProfile` 전부 수정.
+1. uncommitted 횡단보도/정지선 코드 → 빌드 검증 → 커밋 `691c0596` → push. `git status` clean.
+2. 일반화 설계를 명세로 확정 (`SPEC_Scope_v0.2.md`, `SPEC_Validation_v0.1.md` 신규 + 7개 문서 수정) → 커밋 `77890c3c` → push.
+3. **§7 item 1 완료 — `kr_transit`의 영도 하드코딩을 scope 판정으로 교체.** `PRIMARY_ROUTE`/`YEONGDO_LON_MIN/MAX`/`YEONGDO_LAT_MIN/MAX`/`is_in_yeongdo_range`를 전부 제거하고 새 `src/kr_scope/mod.rs`(`Scope`/`ScopePiece`, `SPEC_Scope_v0.2.md §1-§4` 구현)로 교체했다. 구현 중 실측으로 scope 설계를 한 번 더 다듬었다 — route_strip 조각을 전역 판정에 썼더니 508이 지나는 도심 환승 거점(남포동·중앙동·초량·부산역)을 스치는 무관한 노선까지 20→51개로 딸려왔다. `SPEC_Scope §4.1.1` "조각의 두 역할"로 해소: 영역 조각(rect/admin_polygon)은 전체 노선 판정에 쓰이고, 노선 조각(route_strip)은 자기 노선만 self-qualify한다(`Scope::contains_for_route`). **검증 완료** — 영도 사각형 ∪ 508 띠로 실데이터를 돌려 리팩터 전 baseline과 대조, 정규화 후 완전 일치(diff 0, 20개 노선·161개 정류소 동일). 커밋 `e456c168`, **push는 아직 안 함**.
 
-**다음 세션이 할 일** — 이 명세들을 코드로 옮기는 것. 우선순위는 §7 "일반화 계획"을 그대로 따른다: `kr_transit`의 영도 하드코딩 제거(scope 판정으로 대체)가 가장 먼저다. 코드를 만지기 전에 새 명세 7개(`SPEC_Scope_v0.2.md` 전체, 나머지는 각 문서의 변경된 절)를 먼저 읽을 것 — 특히 `SCALE`이 이제 상수가 아니라 실행 파라미터로 바뀌어 도로·가로 요소·건물·교량 치수 계산 방식이 전부 "실제값 × SCALE 반올림" 공식으로 바뀌었다.
+**다음 세션이 할 일** — `e456c168` push 여부 확인 먼저. 그다음 §7의 나머지 항목: 2번(교량 프리셋 파일 읽기), 4번(`SCALE` 파라미터화, 1번과 맞물려 있음). `Scope::contains`(전역 물리 scope, L0-L3)는 아직 아무 데도 안 붙어 있다 — 지형/도로/건물 생성 범위를 scope에 연결하는 건 이번에 하지 않았다.
 
 **빌드 전 메모리 확인은 여전히 유효하다.**
 
@@ -135,10 +136,10 @@ arnis.exe --input-source kr \
 
 ### 구조적으로 막힌 곳 (코드 수정 필요)
 
-1. **`src/kr_transit/mod.rs`의 "이 지역인가?" 판정 전체가 영도 전용이다.**
-   - `PRIMARY_ROUTE = "508"` (line ~35) — 항상 전량 포함시키는 "주 노선"이 하드코딩. 다른 지역이면 다른 노선번호이거나 아예 "주 노선" 개념이 없을 수 있다.
-   - `YEONGDO_LON_MIN/MAX`, `YEONGDO_LAT_MIN/MAX` (line ~37-40) + `is_in_yeongdo_range()` — 행정경계 폴리곤이 없어서 위경도 사각형으로 "영도구인가"를 대신 판정한다. 이게 노선/정류소가 "이 실행 범위에 속하는가"를 가르는 유일한 신호다.
-   - **일반화 방향이 바뀌었다.** "CLI 플래그로 뺀다"가 아니라 **scope 판정으로 대체하여 이 판정 자체를 제거한다.** `SPEC_Scope_v0.2.md §4.1`이 정의하는 대로, 정류소는 scope(사각형·행정구역 폴리곤·노선 띠의 합집합) 안인지 하나로만 판정한다. `PRIMARY_ROUTE` 특례는 "508을 route_strip scope 조각으로 추가"한 결과로 재현되므로(`SPEC_Scope_v0.2.md §4.1`, `§7` 영도 예시), 508을 봐주는 분기 자체가 코드에서 사라진다. `YEONGDO_LON_MIN/MAX` 하드코딩도 마찬가지로 사라지고 scope 조각(프리셋의 `[[scope]]`, `SPEC_Scope §5.1`)으로 대체된다.
+1. **완료 (2026-09-18, 커밋 `e456c168`).** `src/kr_transit/mod.rs`의 `PRIMARY_ROUTE`/`YEONGDO_LON_MIN/MAX`/`YEONGDO_LAT_MIN/MAX`/`is_in_yeongdo_range`를 전부 제거하고, 새 `src/kr_scope/mod.rs`(`Scope`/`ScopePiece`)의 scope 판정으로 대체했다. `kr_transit::resolve_scope_pieces`가 프리셋의 `ScopePieceInput`(`kr_scope::presets::yeongdo()`)을 실제 지오메트리로 바꾸고, 노선 채택·정류소 절단 둘 다 `Scope::contains_for_route` 하나로 판정한다.
+   - **구현 중 명세가 한 번 더 갈렸다.** route_strip 조각을 모든 노선에 똑같이 적용되는 전역 판정(`Scope::contains`)에 썼더니, 508이 지나는 도심 환승 거점(남포동·중앙동·초량·부산역)을 스치기만 하는 무관한 노선까지 채택돼 노선 수가 20→51개로 늘었다(실측). `SPEC_Scope_v0.2.md §4.1.1` "조각의 두 역할"로 해소 — 영역 조각(rect/admin_polygon)은 모든 노선의 채택 판정에 쓰이고, 노선 조각(route_strip)은 **자기 노선의 판정에만** 관여한다. 지형·도로·건물 생성 범위(아직 코드에 안 붙어 있음)는 여전히 전 조각의 순수 합집합(`Scope::contains`)을 쓴다 — 예외는 노선/정류소 채택뿐이다.
+   - **검증**: 영도 사각형 ∪ 508 route_strip 프리셋으로 실데이터(`data/`)를 돌려, 리팩터 전 스냅샷(`stops_review_BASELINE_pre_scope_refactor.json`)과 정규화 비교 — 완전 일치(20개 노선, 161개 정류소, route별 kept/cut까지 전부 동일).
+   - 남은 일: `Scope::contains`(전역 물리 scope)를 실제 L0/L1/L2 지형·도로·건물 생성 범위에 연결하는 건 아직 안 했다 — 지금은 `kr_transit`의 노선/정류소 판정에만 쓰인다.
 
 2. **`src/kr_roads/bridges.rs`의 `MANUAL_BRIDGES`가 영도대교·부산대교 두 개로 완전히 하드코딩돼 있다.**
    - 표준노드링크 데이터 자체에 교량 여부 필드가 없어서, 이 두 다리는 좌표(EPSG:5186 waypoints)와 MOCT 노드 ID를 손으로 찾아 박아넣은 것이다(M3 module doc에 이미 명시).
@@ -160,4 +161,4 @@ arnis.exe --input-source kr \
 
 ### 우선순위 제안
 
-1번(`kr_transit` scope 판정으로 대체)부터 손대는 게 맞다 — 이게 없으면 다른 지역 버스 노선이 아예 하나도 안 걸리고, `SPEC_Scope_v0.2.md`가 정의한 scope 모델 전체가 이 지점에서 막힌다. 2번(교량)은 프리셋에 없으면 다리 없이 돌아가도록 설계됐으니(`SPEC_Bridge §0`) 급하지 않다 — §1의 완주 조건에서 "교량 연결"도 이미 뺐다(`SPEC_Build §1`). 4번(`SCALE` 파라미터화)은 1번과 맞물려 있다 — scope 판정을 뜯을 때 같이 손대는 게 효율적이다. 3, 5~7번은 실제로 다른 지역 데이터를 넣어보면서 하나씩 걸리는 대로 고치면 된다.
+**1번 완료 (2026-09-18).** 다음은 4번(`SCALE` 파라미터화) — 1번과 맞물려 있어서(둘 다 `kr_transit`/스케일 관련 상수를 실행 파라미터로 빼는 작업) 이어서 하는 게 효율적이다. 2번(교량)은 프리셋에 없으면 다리 없이 돌아가도록 설계됐으니(`SPEC_Bridge §0`) 급하지 않다 — §1의 완주 조건에서 "교량 연결"도 이미 뺐다(`SPEC_Build §1`). 3, 5~7번은 실제로 다른 지역 데이터를 넣어보면서 하나씩 걸리는 대로 고치면 된다.
