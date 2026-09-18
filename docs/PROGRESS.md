@@ -1,24 +1,24 @@
 # PROGRESS — 진행 상황
 
-마지막 갱신: 2026-09-16. 이 문서 하나만 읽고 다음 세션을 이어갈 수 있게 쓴다.
+마지막 갱신: 2026-09-18. 이 문서 하나만 읽고 다음 세션을 이어갈 수 있게 쓴다.
 
 ---
 
 ## 0. 지금 당장 할 일
 
-**빌드부터 확인하라.** 지난 세션은 `cargo build`가 시스템 메모리 부족으로 4번 연속(기본, `-j 2`, `-j 1`, `CARGO_PROFILE_RELEASE_LTO=false` 전부 시도) 죽어서 코드를 검증도 못 하고 끝났다.
+**2026-09-18 상태 — 둘 다 이번 세션에서 처리됨:**
+
+1. §0(구판)이 말하던 uncommitted 횡단보도/정지선 코드는 여유 메모리 확인 후 debug 빌드로 컴파일 검증(최초 성공, 18분 50초) → 커밋 `691c0596` → push 완료. `git status` clean.
+2. **일반화 설계를 명세로만 확정했다. 코드는 아직 하나도 안 건드렸다.** 영도·508 전용으로 하드코딩됐던 scope·좌표계·수계·검증 설계를 지역 무관 구조로 다시 썼다 — 새 문서 `SPEC_Scope_v0.2.md`(구 `SPEC_GenerationScope_v0.1.md` 대체), `SPEC_Validation_v0.1.md`(신규), 그리고 `SPEC_Ingest`/`SPEC_RoadSection`/`SPEC_StreetFurniture`/`SPEC_BuildingType`/`SPEC_Bridge`/`SPEC_Build`/`SPEC_RoadProfile` 전부 수정.
+
+**다음 세션이 할 일** — 이 명세들을 코드로 옮기는 것. 우선순위는 §7 "일반화 계획"을 그대로 따른다: `kr_transit`의 영도 하드코딩 제거(scope 판정으로 대체)가 가장 먼저다. 코드를 만지기 전에 새 명세 7개(`SPEC_Scope_v0.2.md` 전체, 나머지는 각 문서의 변경된 절)를 먼저 읽을 것 — 특히 `SCALE`이 이제 상수가 아니라 실행 파라미터로 바뀌어 도로·가로 요소·건물·교량 치수 계산 방식이 전부 "실제값 × SCALE 반올림" 공식으로 바뀌었다.
+
+**빌드 전 메모리 확인은 여전히 유효하다.**
 
 ```powershell
 Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVisibleMemorySize
 ```
-여유 메모리가 몇 GB는 되는지 먼저 확인. 그 다음 빌드 절차는 §5 "Windows 빌드 유의사항" 참고.
-
-**working tree에 uncommitted 변경이 남아있다** (`git status`로 확인):
-- `src/kr_roads/mod.rs` — `DEBUG_ROAD_HIGHLIGHT`(RED_CONCRETE) 원복 + `carriageway_half_width`/`endpoints` accessor 추가
-- `src/kr_street_furniture/mod.rs` — `place_crosswalks` (횡단보도·정지선)
-- `src/data_processing.rs` — 위 둘 연결
-
-**이 코드는 한 번도 컴파일 성공한 적이 없다.** 빌드되면 그 다음에: 대교동/남항동 확대 렌더 + `road-continuity check`가 여전히 0인지 확인한 뒤 커밋. 안 되면 에러 고치고 다시.
+빌드 절차는 §5 "Windows 빌드 유의사항" 참고.
 
 ---
 
@@ -26,7 +26,7 @@ Get-CimInstance Win32_OperatingSystem | Select-Object FreePhysicalMemory,TotalVi
 
 McARN(`AI_Projects/McARN/`, 패키지명 `arnis`, 바이너리 `arnis.exe`)은 오픈소스 Arnis(github.com/louis-e/arnis) 포크다. `--input-source kr` 플래그로 한국 공공 GIS 데이터(표준노드링크 도로망, 건물통합정보, 부산 버스 정류소/노선)를 읽어 실제 지형·도로·건물을 그대로 재현한 Minecraft 월드를 생성한다. 1차 대상 지역은 영도구(부산).
 
-스펙 문서는 전부 `docs/SPEC_*_v0.1.md`에 있다 (Build/Ingest/GenerationScope/RoadProfile/RoadSection/BuildingType/Bridge/StreetFurniture). `SPEC_Build_v0.1.md`가 마일스톤 정의: M0(지형) → M1(도로) → M2(버스) → M3(교량) → M4(건물) → M5(가로 요소).
+스펙 문서는 `docs/SPEC_*.md`에 있다 (Build/Ingest/RoadProfile/RoadSection/BuildingType/Bridge/StreetFurniture는 `_v0.1`, 범위 정의는 `SPEC_Scope_v0.2.md` — 구 `SPEC_GenerationScope_v0.1.md`는 폐기됨 — 검증 지표는 `SPEC_Validation_v0.1.md`, 신규). `SPEC_Build_v0.1.md`가 마일스톤 정의: M0(지형) → M1(도로) → M2(버스, 선택) → M3(교량) → M4(건물) → M5(가로 요소). M0~M5는 구현 순서이고, 한 번 실행할 때 무엇을 생성할지는 별도 `--quality` 옵션이 정한다 (`SPEC_Build §2`).
 
 McBPT/McBLS/McRIG과는 무관한 별개 프로젝트 — 이쪽은 독립 월드 생성기, 저쪽은 Minecraft 애드온/플러그인.
 
@@ -131,33 +131,33 @@ arnis.exe --input-source kr \
 
 ## 7. 일반화 계획 — 영도 말고 다른 지역에도 쓰려면
 
-지금 파이프라인은 영도구 하나만 놓고 만들어졌다. 다른 지역(예: 부산 다른 구, 다른 도시)에 쓰려면 구조적으로 막혀있는 지점이 두 곳, 데이터 포맷 리스크가 한 곳 있다. 코드 전수 조사 결과(2026-09-16):
+지금 코드는 여전히 영도구 하나만 놓고 만들어져 있다 — **이 절이 가리키는 코드 전수 조사는 2026-09-16 것 그대로다. 2026-09-18에 바뀐 건 설계(명세)뿐, 코드는 아직 손대지 않았다.** 아래 각 항목에 그 사이 확정된 명세 위치를 달아뒀다. 다음 세션은 이 명세를 따라 코드를 고치면 된다.
 
 ### 구조적으로 막힌 곳 (코드 수정 필요)
 
 1. **`src/kr_transit/mod.rs`의 "이 지역인가?" 판정 전체가 영도 전용이다.**
    - `PRIMARY_ROUTE = "508"` (line ~35) — 항상 전량 포함시키는 "주 노선"이 하드코딩. 다른 지역이면 다른 노선번호이거나 아예 "주 노선" 개념이 없을 수 있다.
    - `YEONGDO_LON_MIN/MAX`, `YEONGDO_LAT_MIN/MAX` (line ~37-40) + `is_in_yeongdo_range()` — 행정경계 폴리곤이 없어서 위경도 사각형으로 "영도구인가"를 대신 판정한다. 이게 노선/정류소가 "이 실행 범위에 속하는가"를 가르는 유일한 신호다.
-   - **일반화 방향**: 이 둘을 CLI 플래그나 별도 설정 파일로 빼야 한다 — 예: `--kr-primary-route <노선번호>` (선택), `--kr-scope-bbox <lat,lon,lat,lon>` 또는 실제 행정경계 폴리곤 파일 경로. 폴리곤을 쓸 수 있으면 사각형보다 정확해지고, 지역 경계 근처 정류소 오분류(§1.1에 이미 disclosed된 한계) 문제도 줄어든다.
+   - **일반화 방향이 바뀌었다.** "CLI 플래그로 뺀다"가 아니라 **scope 판정으로 대체하여 이 판정 자체를 제거한다.** `SPEC_Scope_v0.2.md §4.1`이 정의하는 대로, 정류소는 scope(사각형·행정구역 폴리곤·노선 띠의 합집합) 안인지 하나로만 판정한다. `PRIMARY_ROUTE` 특례는 "508을 route_strip scope 조각으로 추가"한 결과로 재현되므로(`SPEC_Scope_v0.2.md §4.1`, `§7` 영도 예시), 508을 봐주는 분기 자체가 코드에서 사라진다. `YEONGDO_LON_MIN/MAX` 하드코딩도 마찬가지로 사라지고 scope 조각(프리셋의 `[[scope]]`, `SPEC_Scope §5.1`)으로 대체된다.
 
 2. **`src/kr_roads/bridges.rs`의 `MANUAL_BRIDGES`가 영도대교·부산대교 두 개로 완전히 하드코딩돼 있다.**
    - 표준노드링크 데이터 자체에 교량 여부 필드가 없어서, 이 두 다리는 좌표(EPSG:5186 waypoints)와 MOCT 노드 ID를 손으로 찾아 박아넣은 것이다(M3 module doc에 이미 명시).
-   - **일반화 방향**: 이건 "코드를 고친다"로 해결 안 된다 — 다른 지역 쓰려면 그 지역 교량을 똑같이 수작업으로 찾아서 항목을 추가해야 한다. 할 수 있는 일반화는: 하드코딩된 `&[ManualBridge]` 상수 대신 **지역별 교량 설정 파일**(JSON/TOML, waypoints+node ID+제외 링크 목록)을 읽게 바꿔서, 다음 지역을 추가할 때 코드를 다시 컴파일하지 않고 파일만 추가하면 되게 만드는 것. 여전히 사람이 표준노드링크를 뒤져서 교량 좌표를 찾아야 하는 건 못 피한다.
+   - **스키마가 확정됐다.** `SPEC_Scope_v0.2.md §5.1`의 `[[bridges]]`가 그 설정 파일 형식이다 — waypoints, MOCT 노드 ID, 제외 링크 ID, 형식, 제원. `SPEC_Bridge_v0.1.md §0`도 "교량 목록은 프리셋 파일에서 온다"고 명시하도록 고쳤다. 하드코딩된 `&[ManualBridge]` 상수를 이 프리셋 필드를 읽는 코드로 바꾸면 된다. 여전히 사람이 표준노드링크를 뒤져서 교량 좌표를 찾아야 하는 것 자체는 못 피한다 — 그건 구조가 아니라 데이터 확보의 문제다.
 
 ### 확인은 필요하지만 구조는 괜찮은 곳
 
-3. **Korea TM 투영(`src/projection/korea_tm.rs`)은 실제로 이미 일반적이다** — 원점(E0/N0)을 실행마다 `--bbox`/`--bbox-en`에서 계산한다, 하드코딩된 지역 좌표 없음. 다만 항상 EPSG:5186(중부원점, 127°E)을 쓴다 — 한국은 서부/중부/동부 3개 TM 원점이 따로 있는데, 그중 중부만 쓰는 게 고정이다. 영도(129°E)는 중부원점에서 좀 떨어져 있어도 수치적으로는 문제없이 동작하지만, 다른 지역이 서부/동부원점 관할이면 "공식적으로 맞는" 원점은 아니게 된다. 엄밀히 하려면 bbox 경도로 원점을 자동 선택하는 로직이 필요할 수 있음 — 급한 건 아니다.
-4. **`scale = 1.75`가 `--input-source kr`에서 고정값으로 강제된다** (SPEC_Ingest §2 근거). 지역 문제는 아니지만, 다른 축척을 쓰고 싶은 경우를 위한 조정 여지는 없다.
-5. **`kr_buildings`의 건물통합정보 `.dbf` 컬럼 매핑(`A9`=주용도, `A13`=사용승인일 등)이 영도 실 데이터를 샘플링해서 역추적한 것이다** (컬럼명이 전부 익명화된 배포본이라 공식 필드 사전이 없다). 다른 지역 `.dbf`가 같은 스키마를 쓰는지 확인 안 됨 — 다른 지역 데이터를 처음 넣을 때 이 매핑이 맞는지부터 검증해야 한다. 코드 구조 문제가 아니라 **데이터 검증 리스크**.
-6. **`kr_bus_routes::REFERENCE_DATE = "2023-07-31"`** — 지금 쓰는 CSV 파일 자체의 기준일. 다른 CSV(다른 지역이든 최신판이든)를 쓸 때 이 상수가 실제로 그 파일에서 읽어오는 게 아니라 고정값이면, 파일을 바꿔도 `manifest.json`엔 옛날 날짜가 찍힌다 — 다음에 손댈 때 CSV에서 직접 읽어오게 바꿀지 확인할 것.
+3. **Korea TM 투영(`src/projection/korea_tm.rs`)은 실제로 이미 일반적이다** — 원점(E0/N0)을 실행마다 `--bbox`/`--bbox-en`에서 계산한다, 하드코딩된 지역 좌표 없음. **서부/동부 TM 원점 자동 선택은 하지 않기로 결정했다** — `SPEC_Ingest_v0.1.md §2.1`에 이유를 명시했다: 전국 단일 좌표 프레임이라 인접 지역 맵이 이어 붙고, 국내 최원거리에서도 축척 오차 0.1% 미만이라 실용적 문제가 없다. EPSG:5186 하나로 고정하고, 다른 원점이 필요하면 프리셋 `overrides`로 덮어쓰는 것만 허용한다. 이 항목은 더 이상 "확인 필요"가 아니라 **결정 완료**다.
+4. **`scale = 1.75`가 `--input-source kr`에서 고정값으로 강제된다.** 이제는 아니다 — `SPEC_Ingest_v0.1.md §2.2`가 `SCALE`을 실행 파라미터(기본값 1.75)로 바꿨다. 코드에서 상수를 파라미터로 빼는 작업이 남았다. 연동 범위가 크다 — `SPEC_RoadSection`/`SPEC_StreetFurniture`/`SPEC_BuildingType`/`SPEC_Bridge`의 모든 치수 표가 "실제값 × `SCALE`" 공식으로 다시 쓰였으므로, `SCALE`을 파라미터화하는 코드 변경은 이 문서들이 정의한 공식을 그대로 구현하는 작업이 된다.
+5. **`kr_buildings`의 건물통합정보 `.dbf` 컬럼 매핑(`A9`=주용도, `A13`=사용승인일 등)이 영도 실 데이터를 샘플링해서 역추적한 것이다** (컬럼명이 전부 익명화된 배포본이라 공식 필드 사전이 없다). **이제 이 매핑 자체를 설정으로 분리하는 구조가 정해졌다** — `SPEC_Scope §5.1`의 `buildings.dbf_schema`가 이름으로 가리키는 매핑 파일이다. 추가로 `SPEC_Ingest §4.1`이 적재 시 자기 검증(날짜 형식 확인, 용도 코드집합 대조, 실패 시 중단)을 필수로 요구하도록 바뀌었다 — 이게 있으면 다른 지역에서 매핑이 어긋나도 결측값으로 조용히 새는 대신 그 자리에서 멈춘다. 여전히 **데이터 검증 리스크**는 남는다 — 다른 지역 `.dbf`가 같은 스키마를 쓰는지는 실제로 넣어봐야 안다.
+6. **`kr_bus_routes::REFERENCE_DATE = "2023-07-31"`** — 지금 쓰는 CSV 파일 자체의 기준일. 다른 CSV(다른 지역이든 최신판이든)를 쓸 때 이 상수가 실제로 그 파일에서 읽어오는 게 아니라 고정값이면, 파일을 바꿔도 `manifest.json`엔 옛날 날짜가 찍힌다. `SPEC_Scope §5.1`의 `transit.baseline_date`가 이 값을 프리셋에서 지정하는 자리를 정의했지만, "CSV에서 직접 읽어올지" 여부는 아직 코드 결정으로 남아 있다.
 7. **CLI 플래그 자체(`--kr-bus-stops-dir` 등)는 이미 일반적**이다(임의 경로를 받음) — `args.rs`의 doc comment가 "부산 버스 정류소 SHP"라고 못박아 써놔서 다른 지역 데이터를 넣어도 되는지 헷갈릴 수 있다는 것뿐. 코드 문제 아니고 문서 문구 문제.
 
 ### 하지 않아도 되는 것
 
 - `kr_roads`의 도로망 클리핑(`clip()`)은 이미 실행마다 넘어온 bbox로 동작한다 — 하드코딩 없음.
-- `kr_street_furniture`의 모든 상수(간격·크기 등)는 지역 무관 설계 수치다 — SPEC_StreetFurniture.md 자체가 전국 공통으로 잡은 값들.
+- `kr_street_furniture`의 모든 상수(간격·크기 등)는 지역 무관 설계 수치다 — `SPEC_StreetFurniture.md` 자체가 전국 공통으로 잡은 값들이고, 이제 축척 공식으로 재정의됐다(§4).
 - `MOCT_LINK.dbf`/`MOCT_NODE.dbf` 파일명은 표준노드링크 자체의 전국 공통 스키마 — 손댈 필요 없음.
 
 ### 우선순위 제안
 
-다른 지역을 실제로 넣어보게 된다면 위 1번(`kr_transit` 스코프 판정)부터 손대는 게 맞다 — 이게 없으면 그 지역 버스 노선이 아예 하나도 안 걸린다. 2번(교량)은 데이터가 없으면 그냥 다리 없이 돌아가니(§1의 완주 조건은 통과 못하겠지만) 급하지 않다. 3~7번은 실제로 다른 지역 데이터를 넣어보면서 하나씩 걸리는 대로 고치면 된다.
+1번(`kr_transit` scope 판정으로 대체)부터 손대는 게 맞다 — 이게 없으면 다른 지역 버스 노선이 아예 하나도 안 걸리고, `SPEC_Scope_v0.2.md`가 정의한 scope 모델 전체가 이 지점에서 막힌다. 2번(교량)은 프리셋에 없으면 다리 없이 돌아가도록 설계됐으니(`SPEC_Bridge §0`) 급하지 않다 — §1의 완주 조건에서 "교량 연결"도 이미 뺐다(`SPEC_Build §1`). 4번(`SCALE` 파라미터화)은 1번과 맞물려 있다 — scope 판정을 뜯을 때 같이 손대는 게 효율적이다. 3, 5~7번은 실제로 다른 지역 데이터를 넣어보면서 하나씩 걸리는 대로 고치면 된다.
