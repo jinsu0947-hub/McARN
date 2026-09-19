@@ -198,6 +198,7 @@ fn run_cli() {
         .unwrap_or_else(|e| e.exit());
     args::apply_body_defaults(&mut args);
     args::apply_input_source_defaults(&mut args, scale_explicit);
+    args::expand_bbox_for_kr_scope(&mut args);
     let args = args;
 
     // Validate arguments (path requirements differ between Java and Bedrock)

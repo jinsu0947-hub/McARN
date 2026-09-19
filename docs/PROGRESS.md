@@ -6,7 +6,181 @@
 
 ## 0. 지금 당장 할 일
 
-**2026-09-19 상태 — P1 재생성 완주, 4개 검증 항목 모두 확인 완료:**
+**2026-09-19 상태 (2차) — SCALE 파라미터화 완료 + scope/bbox 구조적 버그 발견·수정:**
+
+`PROGRESS.md §7` item 4(`SCALE` 파라미터화)를 완료했다. 작업 도중 scope와
+`--bbox`의 관계에 구조적 결함이 있는 것을 발견해(§6 "scope 연결 실행 검증"과
+같은 뿌리) 함께 고쳤다. 커밋 전 상태 — 다음 세션은 검증 결과를 확인하고
+커밋할 것.
+
+**1) SCALE 파라미터화 (`SPEC_Ingest §2.2`, `PROGRESS.md §7` item 4)**
+
+- `args.rs`: `--input-source kr`가 더 이상 `scale`을 1.75로 무조건 덮어쓰지
+  않는다. `main.rs`가 `Args::parse()` 대신 `clap::ArgMatches`를 직접 써서
+  "사용자가 `--scale`을 실제로 타이핑했는가"(`scale_explicit`)를
+  `apply_input_source_defaults`에 넘긴다 — clap의 `default_value_t`만으로는
+  "안 씀"과 "명시적으로 1.0을 씀"을 구분할 수 없어서(둘 다 `f64` 값 1.0으로
+  같다) 필요했던 우회. 기본값 1.75는 유지, 명시하면 그 값을 쓴다.
+- `kr_roads::scale_round`/`scale_round_y2`/`round_up_to_even`/`round_or_omit`
+  신설 — `round(실제_m × SCALE)` 계열 공식을 한 곳에 모았다.
+- `kr_roads::section_spec(class, scale)`: 인도(2.0m, 짝수 올림)·갓길(2.5m)·
+  차로(주간선 3.5m/보조 3.0m)·중앙분리대(2.0m, 물리형만) 전부 공식화.
+  F등급의 "8(단일 포장면)"은 §1 어느 단위에도 대응하지 않는 값이라 실제
+  4.5m로 역산해 disclosed 상수로 넣었다(`SPEC_RoadSection_v0.1.md §2`에
+  이유 기록). §7 "축척 생략 규칙"(인도/갓길/중앙분리대 1블록 미만 →
+  0, F 총폭 4블록 미만 → 전체 0)도 `round_or_omit`으로 구현 — 단,
+  스케일=1.0/3.0 둘 다 이 임계값 아래로 안 떨어져서 실제 생략 발동은
+  이번 검증에서 확인 못 했다(아래 결과 참고). 연석 폭(1, 고정)과
+  연석 높이(`curb_height_y2`, `max(1, round(0.25m×SCALE×2))`)는
+  §7 "생략 없음" 그대로 유지.
+- `kr_roads::Segment`에 `scale: f64` 필드 추가 — 도로 배치 계열 함수
+  (`sweep_and_place`/`register_ground_overrides`/`mark_paved_footprint`/
+  `place_retaining_walls`/`place_segments`)가 세그먼트당 스케일을
+  들고 다녀서, `data_processing.rs`의 여러 호출부를 전부 고칠 필요가
+  없었다. `road_total_width`/`sidewalk_width`/`carriageway_half_width`/
+  `furniture_column`/`carriage_edge_column`처럼 `Segment` 없이 `RoadClass`만
+  받던 함수들은 `scale: f64`를 명시 인자로 추가.
+- `kr_buildings::floor_heights(group, scale)`(주거·상가업무 3.4/4.6m,
+  산업 6.9m)와 `total_height_blocks`도 스케일 인자 추가.
+  `PlannedBuilding`에 `scale: f64` 필드 추가(facade.rs/slope.rs가
+  `&PlannedBuilding`만 받아서 별도 인자 전달이 안 됨).
+- `kr_buildings::slope`: §10.2 판정 경계(`grade_threshold`,
+  `round(1.1m×SCALE)+1`)와 단일 축대 높이 상한(`max_single_tier_blocks`,
+  R의 기준층 높이 재사용 — I를 포함해 모든 그룹에 하나만 적용, 그룹별로
+  나누면 기존 동작이 바뀌므로 안 함)을 스케일화.
+- `kr_street_furniture`: 전주 간격(34m 대표값)·높이(10.3m), 횡단보도
+  길이(3.5m, "3~4m" 대표값)·정지선 폭(0.375m)·줄무늬 폭(0.45m) 전부
+  공식화 — 정지선/줄무늬는 이전엔 암묵적으로 항상 1블록이던 걸 실제
+  루프로 반복 가능하게 고쳤다(`stop_line_width`/`crosswalk_stripe_width`
+  루프). 버스 승차대(폭·깊이·높이)는 §3.1 자체에 "실제" 열이 없어서
+  기존 7×3×5 블록을 정확히 재현하는 실제값(4.0m/1.7m/2.9m)을 disclosed로
+  붙였다(`SPEC_StreetFurniture_v0.1.md §3.1`에 표로 기록). 가로등·차선
+  점선은 아직 미구현이라 대상 없음.
+- SPEC_Bridge §2(세계 높이 제약)는 손댈 코드가 없었다 — 주탑/아치(§3/§4)가
+  아직 구현 안 됐고(`bridges.rs`는 상판만 구현), 상판 높이는 이미 스케일이
+  적용된 도로/지형 높이 계산을 그대로 쓰므로 별도 클램프 로직이 존재하지
+  않는다. 확인만 하고 넘어감 — 나중에 주탑/아치를 구현할 때 이 세션이
+  아니라 그때 §2를 적용해야 한다.
+- `kr_bus_routes::REFERENCE_DATE`(고정 상수) 제거,
+  `reference_date_from_filename(csv_path)`로 교체 — CSV 파일명
+  (`..._YYYYMMDD.csv`)에서 직접 읽는다. CSV 자체엔 기준일 필드가 없어서
+  내용이 아니라 파일명에서 읽는다; 패턴이 안 맞으면 기존 상수값으로
+  경고와 함께 폴백. `PROGRESS.md §7` item 6 완료.
+
+**2) scope/bbox 구조적 버그 (SCALE 검증 중 발견, `SPEC_Scope §0/§2` 위반)**
+
+검증 1단계(P1 전역, rect-only vs rect∪508)에서 두 scope 설정의 타일 수가
+399/462로 **동일**하게 나왔다 — route_strip을 넣으나 빼나 결과가 같다는
+뜻으로, 사용자가 직접 진단했다: `--bbox`가 scope 조각들의 합집합과 무관한
+독립 클립으로 남아 있어서, `--bbox` 밖으로 뻗는 route_strip 조각이 애초에
+살아남을 수 없었다. `SPEC_Scope_v0.2.md §0/§2`는 "생성 범위 = 조각들의
+합집합"이라고 명시하는데, `--bbox`는 그 합집합의 **입력**(사각형 조각을
+만드는 재료) 중 하나여야지 그 위에 얹히는 별도 상한이면 안 된다.
+
+**원인**: `build_transformer`의 `KoreaTm` 분기(`src/projection/mod.rs`)가
+`XZBBox`(타일 그리드 전체)를 `korea_planar_bbox`(=`--bbox`/`--bbox-en`에서만
+옴)의 `width_m()`/`height_m()`으로 산출한다 — scope가 나중에(`kr_transit`
+안에서) resolve될 때는 이미 세계 크기가 고정된 뒤라, route_strip이 아무리
+멀리 뻗어도 타일 그리드 자체가 거기까지 존재하지 않았다.
+
+**수정**:
+- `kr_scope::Scope::bounding_rect_en()` 신설 — 조각 전부(Rect는 4개 꼭짓점
+  투영, RouteStrip은 각 점 ± `buffer_m`)의 EPSG:5186 외접 사각형을 낸다.
+- `args::expand_bbox_for_kr_scope()` 신설, `main.rs`에서
+  `apply_input_source_defaults` 직후·`args` 불변화 직전에 호출 — 이 시점의
+  `korea_planar_bbox`로 `kr_transit::build_stops_document`를 미리 한 번
+  돌려 `Scope`를 얻고, 그 `bounding_rect_en()`이 원래 `--bbox`보다 크면
+  `args.bbox`/`korea_planar_bbox`를 그 외접 사각형으로 넓힌다. 매칭을
+  한 번 더 하는 낭비(몇 초)를 감수하고 `generate_world_with_options`
+  호출 그래프는 안 건드렸다 — `StopsDocument`를 앞으로 끌어와 재사용하는
+  건 더 큰 리팩터라 이번엔 안 함.
+- 확장 시 콘솔에 `KR scope: --bbox expanded from ... to ...` 로 알린다 —
+  사용자가 지정한 범위가 조용히 넓어지는 걸 감추지 않는다.
+
+**3) 검증 (지시대로 "실행 세 번", `RAYON_NUM_THREADS=3`)**
+
+**1번 — 영도 P1 사각형, scale 1.75, diff 0**: 통과. 이전에 이미 얻어둔
+"직전 커밋" 월드(`/c/mcarn_build/p1_baseline_prescale`, 커밋 `98c8ef65`
+결과물)와 동일 설정으로 재생성한 새 월드를 대조했다.
+- `roadgraph.json`/`buildings.json`/`stops.json`을 id 기준으로 정렬해
+  비교 — **전부 0건 차이**. (raw MD5는 셋 다 달랐는데, Rust `HashMap`의
+  랜덤 반복 순서 때문— 정렬 비교로 노이즈 제거했다. `buildings.json`만은
+  MD5도 일치했다, `Vec` 기반이라 반복 순서가 원래 결정적.)
+- Anvil 블록 레벨은 **전체 월드 exhaustive scan을 두 번 시도했다가 둘 다
+  하네스 저메모리 보호에 죽었다** (약 436,000청크 × 전체 Y범위를 한
+  Node 프로세스가 붙잡는 구조라 이 8GB 기계엔 안 맞음) — 재시도하지 않고
+  방법을 바꿨다: 도로·건물(R/O/I 유형 포함) 실제 좌표 8곳을 표본으로
+  뽑아 작은 bbox(200×200블록) 단위 `anvil-diff`를 순차 실행, 총 1,457
+  청크에서 **차이 0**. 전수 스캔은 아니지만 위 JSON 동치 증명과 합쳐
+  diff-0 결론에 신뢰도가 충분하다고 판단.
+- `scripts/anvil-diff/semantic_diff.js` 신설(id 정렬 비교), 재사용 가능.
+
+**2번 — scope 연결 실행 검증 (`§6`, 미뤄뒀던 것)**: 통과, 단 **P1
+전역이 아니라 P0급 소규모로 다시 설계해서 검증했다** — 사용자가 위 구조적
+버그를 진단하며 지시함. 두 번의 시행착오가 있었다:
+- 1차 시도(P1 전역, rect vs rect∪508): 타일 수 399/462로 동일 →
+  버그 발견(위 2번 항목). 재시도하지 않고 사용자에게 보고, 원인 진단과
+  수정 지시를 받음.
+- 2차 시도(수정 후, P0 사각형 35.0695~35.0829/129.0320~129.0484 ∪ 508):
+  **508 자체가 부산 도심까지 뻗는 실제 장거리 노선**이라, rect를 아무리
+  작게 잡아도 508의 실제 길이 때문에 고도 fetch 그리드가 P1급으로
+  커져서 land-cover repair 단계에서 또 OOM. 재시도하지 않고 원인을
+  파악(`--bbox expanded ... to 4308m x 6130m` 로그로 확인) —
+  "짧은 노선 띠"가 필요하다는 지시를 다시 읽고 508 대신 **11번**
+  노선으로 교체(정류소 이름이 전부 영도봉래시장·영도우체국·대교사거리·
+  남항동·영선동뿐이라 확인된 영도 내 단거리 순환선, 실측 span 약 950m).
+- 3차 시도(P0 ∪ 11번): **완주**. 타일 수 42(사각형만) vs 526/812
+  (사각형∪11번) — **이제는 다르다**, 버그가 고쳐졌다는 직접 증거.
+  road-continuity check 양쪽 다 0 unplaced.
+- 사각형 구간이 "그대로 유지"됐는지는 **좌표 대조가 아니라
+  link_id/building_id 집합 비교로 확인**했다 — 두 실행의
+  `korea_planar_bbox` 원점이 다르고(확장된 실행은 서남단이 이동),
+  더 결정적으로 **고도 압축 계수(`SPEC_Ingest §2.3`)가 scope 크기에
+  따라 달라져서**(사각형만: compression 0, 최고 표고 157m / 사각형∪11:
+  compression 0.029, 최고 표고 485m) 같은 실제 위치도 블록 Y가
+  달라진다 — 이건 버그가 아니라 §2.3의 "H_LINEAR는 scope마다 자동
+  산출" 설계가 의도한 그대로다. 그래서 좌표 오프셋을 맞춰도 Y까지는
+  못 맞추니, 축척·압축과 무관한 **표준노드링크 link_id · 건물통합정보
+  building_id**로 대조했다: 사각형만의 51개 세그먼트 link_id 전부
+  사각형∪11번 쪽에 있음(0건 누락), 623개 건물 building_id도 전부
+  있음(0건 누락) — 추가만 있고 손실 없음, 정확히 요구된 결과.
+  `scripts/anvil-diff/offset-diff.js` 신설(원점이 다른 두 월드를
+  정수 오프셋으로 맞춰 비교) — 결과적으로 이번엔 안 쓰였지만(고도
+  압축 차이로 Y비교 자체가 무의미해서) 원점만 다르고 압축은 같은
+  경우엔 유효하니 남겨둠.
+
+**3번 — scale 1.0/3.0, 같은 P0급 사각형**: scale 3.0으로 시행, **완주**
+(RAYON_NUM_THREADS=3, KR_SCOPE_TEST_SMALL 구성 그대로). 확인된 것:
+- road-continuity check: 0 unplaced.
+- §10.2 경사 판정 버킷이 로그에 그대로 찍혀 공식 적용을 실측 확인 —
+  scale 1.75: `flat(≤2) retain(3-6) tiered(>6)` → scale 3.0:
+  `flat(≤3) retain(4-10) tiered(>10)`. `report_slope_resolution`의
+  `flat_max = round(1.1×3.0) = 3`(로그의 "flat(≤3)"과 일치, `slope::
+  grade_threshold`는 이 값+1=4를 절토/축대 시작 경계로 쓴다 — 즉
+  diff 4부터 그레이딩, diff 3까지 flat, 표기와 정확히 맞음).
+  `max_single_tier_blocks(3.0)` = `floor_heights(R,3.0).1` =
+  `round(3.4×3)=round(10.2)=10` → "tiered(>10)"과 일치.
+- `roadgraph.json`의 실제 폭 값도 손으로 계산한 값과 정확히 일치:
+  인도 6(=`round_up_to_even(round(2.0×3))`), D/E 차도 9
+  (`round(3.0×3)`), C 18(×2차로), B 33(`round(3.5×3)=11`×3차로).
+- 표현 문턱 생략(§7)은 **scale 1.0/3.0 둘 다 발동 안 함** — 인도가
+  0으로 떨어지려면 scale이 0.25 미만이어야 해서, "합리적인" 축척
+  범위에선 생략 규칙 자체를 실행으로 때려볼 수 없었다. 코드 로직은
+  `round_or_omit`에 있고 §7 문턱값과 일치하게 짰지만, 이 세션에서
+  실제 발동은 미확인 — 필요하면 scale <0.25 같은 비현실적인 값으로
+  별도 확인해야 한다(생성 자체가 무의미해질 정도로 작은 값이라
+  실익이 크지 않다고 판단해 하지 않음).
+
+**메모리 교훈 (이 8GB 기계 한정)**: elevation fetch가 **scope 조각의
+실제 지리적 span**(작은 rect라도 그 안에 들어간 route_strip이 멀리
+뻗으면)에 따라 한 번에 큰 사각형 그리드를 통째로 잡는다 — "작은 테스트"를
+설계할 때 rect 크기만 줄이는 걸로는 부족하고, **route_strip에 쓸 노선
+자체가 짧아야** 한다. 508처럼 시내버스 간선(도심까지 관통)을 테스트용
+노선으로 쓰면 rect가 아무리 작아도 P1급 그리드가 나온다.
+
+---
+
+**2026-09-19 상태 (1차) — P1 재생성 완주, 4개 검증 항목 모두 확인 완료:**
 
 이번 세션에서 한 일 (코드, 빌드, 재생성 실행, 실행 결과 검증까지 전부 완료):
 
@@ -249,13 +423,7 @@ arnis.exe --input-source kr \
 
 **프리뷰 렌더러 자체 개선** — 지금은 도로 색을 실제 팔레트로 되돌리는 것으로 건물과의 충돌을 해결했지만(§4의 SPEC_RoadSection §3 도색이 실질적 구분 신호), `map_renderer.rs`가 `road_surface_overrides`를 참고해서 블록 색이 아니라 "이게 도로다"라는 사실 자체로 구분하게 만드는 게 근본적 수정이다. 지금은 안 건드림.
 
-**scope 연결 실행 검증** (2026-09-18, §7 item 1의 마지막 조각 — 미룬 것이지 면제된 것이 아니다). `Scope::contains_en`을 L0/L1/L2 생성 범위에 연결한 코드(커밋 `d291c1b1`)는 단위 테스트와 실데이터 M2 baseline 비교로만 검증됐다 — 실제 바이너리로 월드를 생성해 블록 단위로 비교하는 검증은 아직 하지 않았다. **별도로 돌리지 말고 §7 item 5(`SCALE` 파라미터화) 작업의 전체 실행에 얹는다** (그 작업도 어차피 실제 실행 검증이 필요하므로 한 번에 한다). 절차:
-
-1. 영도 사각형만(scope 조각에서 508 route_strip 제외) 1회 실행 → 월드 A
-2. 영도 사각형 ∪ 508 노선 띠(현재 프리셋 그대로) 1회 실행 → 월드 B
-3. `scripts/anvil-diff`로 A/B를 **사각형 bbox 안에서만** 비교 (`node anvil-diff.js A B --bbox <사각형의 블록 좌표>`) → `totalDiffBlocks: 0`이어야 한다 (사각형 구간은 baseline과 일치, 즉 508 띠 추가가 기존 결과를 건드리지 않는다는 뜻)
-4. 월드 B의 `region/` 폴더에 508 띠 구간(남포동~부산역 쪽) 청크가 실제로 존재하는지 확인 (508 띠 구간은 추가 생성됐다는 뜻 — `anvil-diff`는 두 월드가 공유하는 bbox 안의 "일치 여부"만 보므로 이 부분은 별도 확인)
-5. 3번에서 손실(diff)이 나오면 멈추고 원인부터 보고 — 진행하지 않는다
+**scope 연결 실행 검증 — 완료 (2026-09-19), 단 예상과 다른 결과가 나와서 코드를 한 번 더 고쳤다.** 처음 계획대로 P1 전역에서 사각형만 vs 사각형∪508을 돌렸더니 **타일 수가 동일하게 나와** `Scope::contains_en`이 L0-L2에 연결은 됐지만 `--bbox` 자체가 scope 합집합과 무관한 독립 클립으로 남아 있던 별도 버그를 드러냈다 (§0 "2026-09-19 상태 (2차)"의 "2) scope/bbox 구조적 버그" 참고, `args::expand_bbox_for_kr_scope` 신설로 수정). 수정 후 P0급 소규모(사각형 ∪ 짧은 노선 11번, 508은 실제 거리가 길어 소규모 테스트에도 안 맞음)로 재검증: 타일 수가 달라짐(42 vs 526/812), link_id/building_id 집합 비교로 사각형 구간 무손실 확인(0건 누락), 508(원래 계획)이 아니라 11번으로 대체했다는 점과 좌표계 원점 차이 때문에 anvil-diff 블록 비교 대신 실측 id 비교를 썼다는 점이 원래 계획과 다르다 — 자세한 절차와 이유는 §0 항목 참고.
 
 ---
 
@@ -268,7 +436,7 @@ arnis.exe --input-source kr \
 1. **완료 (2026-09-18, 커밋 `e456c168`).** `src/kr_transit/mod.rs`의 `PRIMARY_ROUTE`/`YEONGDO_LON_MIN/MAX`/`YEONGDO_LAT_MIN/MAX`/`is_in_yeongdo_range`를 전부 제거하고, 새 `src/kr_scope/mod.rs`(`Scope`/`ScopePiece`)의 scope 판정으로 대체했다. `kr_transit::resolve_scope_pieces`가 프리셋의 `ScopePieceInput`(`kr_scope::presets::yeongdo()`)을 실제 지오메트리로 바꾸고, 노선 채택·정류소 절단 둘 다 `Scope::contains_for_route` 하나로 판정한다.
    - **구현 중 명세가 한 번 더 갈렸다.** route_strip 조각을 모든 노선에 똑같이 적용되는 전역 판정(`Scope::contains`)에 썼더니, 508이 지나는 도심 환승 거점(남포동·중앙동·초량·부산역)을 스치기만 하는 무관한 노선까지 채택돼 노선 수가 20→51개로 늘었다(실측). `SPEC_Scope_v0.2.md §4.1.1` "조각의 두 역할"로 해소 — 영역 조각(rect/admin_polygon)은 모든 노선의 채택 판정에 쓰이고, 노선 조각(route_strip)은 **자기 노선의 판정에만** 관여한다. 지형·도로·건물 생성 범위(아직 코드에 안 붙어 있음)는 여전히 전 조각의 순수 합집합(`Scope::contains`)을 쓴다 — 예외는 노선/정류소 채택뿐이다.
    - **검증**: 영도 사각형 ∪ 508 route_strip 프리셋으로 실데이터(`data/`)를 돌려, 리팩터 전 스냅샷(`stops_review_BASELINE_pre_scope_refactor.json`)과 정규화 비교 — 완전 일치(20개 노선, 161개 정류소, route별 kept/cut까지 전부 동일).
-   - 남은 일: `Scope::contains`(전역 물리 scope)를 실제 L0/L1/L2 지형·도로·건물 생성 범위에 연결하는 건 아직 안 했다 — 지금은 `kr_transit`의 노선/정류소 판정에만 쓰인다.
+   - **완료 (2026-09-18 연결 + 2026-09-19 실행 검증).** `Scope::contains_en`이 L0/L1/L2 생성 범위에 연결됐고, 2026-09-19 실행 검증에서 `--bbox`가 그 위에 별도 클립으로 남아있던 버그까지 찾아 고쳤다(`args::expand_bbox_for_kr_scope`, §6 "scope 연결 실행 검증" 참고). 이제 route_strip처럼 `--bbox` 밖으로 뻗는 조각도 실제로 생성 범위에 반영된다.
 
 2. **`src/kr_roads/bridges.rs`의 `MANUAL_BRIDGES`가 영도대교·부산대교 두 개로 완전히 하드코딩돼 있다.**
    - 표준노드링크 데이터 자체에 교량 여부 필드가 없어서, 이 두 다리는 좌표(EPSG:5186 waypoints)와 MOCT 노드 ID를 손으로 찾아 박아넣은 것이다(M3 module doc에 이미 명시).
@@ -277,9 +445,9 @@ arnis.exe --input-source kr \
 ### 확인은 필요하지만 구조는 괜찮은 곳
 
 3. **Korea TM 투영(`src/projection/korea_tm.rs`)은 실제로 이미 일반적이다** — 원점(E0/N0)을 실행마다 `--bbox`/`--bbox-en`에서 계산한다, 하드코딩된 지역 좌표 없음. **서부/동부 TM 원점 자동 선택은 하지 않기로 결정했다** — `SPEC_Ingest_v0.1.md §2.1`에 이유를 명시했다: 전국 단일 좌표 프레임이라 인접 지역 맵이 이어 붙고, 국내 최원거리에서도 축척 오차 0.1% 미만이라 실용적 문제가 없다. EPSG:5186 하나로 고정하고, 다른 원점이 필요하면 프리셋 `overrides`로 덮어쓰는 것만 허용한다. 이 항목은 더 이상 "확인 필요"가 아니라 **결정 완료**다.
-4. **`scale = 1.75`가 `--input-source kr`에서 고정값으로 강제된다.** 이제는 아니다 — `SPEC_Ingest_v0.1.md §2.2`가 `SCALE`을 실행 파라미터(기본값 1.75)로 바꿨다. 코드에서 상수를 파라미터로 빼는 작업이 남았다. 연동 범위가 크다 — `SPEC_RoadSection`/`SPEC_StreetFurniture`/`SPEC_BuildingType`/`SPEC_Bridge`의 모든 치수 표가 "실제값 × `SCALE`" 공식으로 다시 쓰였으므로, `SCALE`을 파라미터화하는 코드 변경은 이 문서들이 정의한 공식을 그대로 구현하는 작업이 된다.
+4. **완료 (2026-09-19).** `scale`이 `--input-source kr`에서 더 이상 고정 강제되지 않는다 — 기본값 1.75는 유지하되 `--scale`을 명시하면 그 값을 쓴다(`args::apply_input_source_defaults`가 `main.rs`의 `scale_explicit` 플래그로 "안 씀"과 "명시적으로 1.0을 씀"을 구분). `SPEC_RoadSection`/`SPEC_StreetFurniture`/`SPEC_BuildingType`의 치수 공식을 코드에 그대로 구현했다(`SPEC_Bridge §2`는 주탑/아치가 아직 미구현이라 대상 코드 자체가 없음 — 확인만 함). scale 1.75(diff 0)·3.0(완주, 임계값 실측 일치) 둘 다 검증됨, 자세한 내용은 §0 "2026-09-19 상태 (2차)" 참고. 이 작업 도중 scope/`--bbox` 관계의 별도 구조적 버그(§6과 얽힘)를 발견해 같이 고쳤다.
 5. **`kr_buildings`의 건물통합정보 `.dbf` 컬럼 매핑(`A9`=주용도, `A13`=사용승인일 등)이 영도 실 데이터를 샘플링해서 역추적한 것이다** (컬럼명이 전부 익명화된 배포본이라 공식 필드 사전이 없다). **이제 이 매핑 자체를 설정으로 분리하는 구조가 정해졌다** — `SPEC_Scope §5.1`의 `buildings.dbf_schema`가 이름으로 가리키는 매핑 파일이다. 추가로 `SPEC_Ingest §4.1`이 적재 시 자기 검증(날짜 형식 확인, 용도 코드집합 대조, 실패 시 중단)을 필수로 요구하도록 바뀌었다 — 이게 있으면 다른 지역에서 매핑이 어긋나도 결측값으로 조용히 새는 대신 그 자리에서 멈춘다. 여전히 **데이터 검증 리스크**는 남는다 — 다른 지역 `.dbf`가 같은 스키마를 쓰는지는 실제로 넣어봐야 안다.
-6. **`kr_bus_routes::REFERENCE_DATE = "2023-07-31"`** — 지금 쓰는 CSV 파일 자체의 기준일. 다른 CSV(다른 지역이든 최신판이든)를 쓸 때 이 상수가 실제로 그 파일에서 읽어오는 게 아니라 고정값이면, 파일을 바꿔도 `manifest.json`엔 옛날 날짜가 찍힌다. `SPEC_Scope §5.1`의 `transit.baseline_date`가 이 값을 프리셋에서 지정하는 자리를 정의했지만, "CSV에서 직접 읽어올지" 여부는 아직 코드 결정으로 남아 있다.
+6. **완료 (2026-09-19).** `kr_bus_routes::REFERENCE_DATE`(고정 상수)를 없애고 `reference_date_from_filename(csv_path)`로 바꿨다 — CSV 파일명(`..._YYYYMMDD.csv`)에서 직접 읽는다(내용엔 기준일 필드가 없어서). 패턴이 안 맞는 파일명이면 기존 상수값(`2023-07-31`)으로 경고와 함께 폴백.
 7. **CLI 플래그 자체(`--kr-bus-stops-dir` 등)는 이미 일반적**이다(임의 경로를 받음) — `args.rs`의 doc comment가 "부산 버스 정류소 SHP"라고 못박아 써놔서 다른 지역 데이터를 넣어도 되는지 헷갈릴 수 있다는 것뿐. 코드 문제 아니고 문서 문구 문제.
 
 ### 하지 않아도 되는 것
@@ -290,4 +458,4 @@ arnis.exe --input-source kr \
 
 ### 우선순위 제안
 
-**1번 완료 (2026-09-18).** 다음은 4번(`SCALE` 파라미터화) — 1번과 맞물려 있어서(둘 다 `kr_transit`/스케일 관련 상수를 실행 파라미터로 빼는 작업) 이어서 하는 게 효율적이다. 2번(교량)은 프리셋에 없으면 다리 없이 돌아가도록 설계됐으니(`SPEC_Bridge §0`) 급하지 않다 — §1의 완주 조건에서 "교량 연결"도 이미 뺐다(`SPEC_Build §1`). 3, 5~7번은 실제로 다른 지역 데이터를 넣어보면서 하나씩 걸리는 대로 고치면 된다.
+**1, 4, 6번 완료 (각각 2026-09-18/09-19/09-19).** 남은 건 2번(교량 프리셋 파일화)과 5, 7번 — 2번은 프리셋에 없으면 다리 없이 돌아가도록 설계됐으니(`SPEC_Bridge §0`) 급하지 않다. 3번(Korea TM 투영)은 결정 완료로 분류됨. 5, 7번은 실제로 다른 지역 데이터를 넣어보면서 하나씩 걸리는 대로 고치면 된다.

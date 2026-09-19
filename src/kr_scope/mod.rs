@@ -72,6 +72,46 @@ impl Scope {
             _ => p.contains(lat, lon, tolerance_m),
         })
     }
+
+    /// SPEC_Scope §2's own "L3 ... scope 외접 사각형" and §0's "모든 층위도
+    /// 자기만의 범위 판정을 따로 갖지 않는다" -- the envelope (EPSG:5186
+    /// easting/northing) of every piece, `RouteStrip` included. This is what
+    /// the *physical* generation area (elevation fetch, tile grid, world
+    /// bbox) should be derived from; `--bbox` alone is only the input that
+    /// becomes the `Rect` piece, never an independent ceiling on top of this
+    /// (`PROGRESS.md`'s 2026-09-19 scope-execution finding: a route_strip
+    /// that reaches outside `--bbox` used to get silently clipped back to
+    /// it, because the world's own extent was fixed from `--bbox` before
+    /// this envelope was ever computed).
+    pub fn bounding_rect_en(&self) -> (f64, f64, f64, f64) {
+        let mut e_min = f64::INFINITY;
+        let mut e_max = f64::NEG_INFINITY;
+        let mut n_min = f64::INFINITY;
+        let mut n_max = f64::NEG_INFINITY;
+        let mut widen = |e: f64, n: f64| {
+            e_min = e_min.min(e);
+            e_max = e_max.max(e);
+            n_min = n_min.min(n);
+            n_max = n_max.max(n);
+        };
+        for piece in &self.pieces {
+            match piece {
+                ScopePiece::Rect { lat_min, lon_min, lat_max, lon_max } => {
+                    for &(lat, lon) in &[(*lat_min, *lon_min), (*lat_min, *lon_max), (*lat_max, *lon_min), (*lat_max, *lon_max)] {
+                        let (e, n) = KoreaTmProjection::project_raw(lat, lon);
+                        widen(e, n);
+                    }
+                }
+                ScopePiece::RouteStrip { points_en, buffer_m, .. } => {
+                    for &(e, n) in points_en {
+                        widen(e - buffer_m, n - buffer_m);
+                        widen(e + buffer_m, n + buffer_m);
+                    }
+                }
+            }
+        }
+        (e_min, n_min, e_max, n_max)
+    }
 }
 
 impl ScopePiece {

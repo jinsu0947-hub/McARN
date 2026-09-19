@@ -730,6 +730,104 @@ pub fn apply_input_source_defaults(args: &mut Args, scale_explicit: bool) {
     };
 }
 
+/// SPEC_Scope.md §0/§2: "모든 층위도 자기만의 범위 판정을 따로 갖지 않는다"
+/// -- the *physical* generation area (elevation fetch, tile grid) must come
+/// from the scope union (every piece, including a `RouteStrip` that reaches
+/// outside `--bbox`), not from `--bbox` alone. `--bbox`/`--bbox-en` only
+/// ever become the scope's own `Rect` piece; they were never meant to be an
+/// independent ceiling on top of the union (2026-09-19 finding, `PROGRESS.md`
+/// §6/§7 item 4: a route_strip piece that geometrically reaches past
+/// `--bbox` used to get silently clipped back to it anyway, because
+/// `korea_planar_bbox` -- which `build_transformer`'s `KoreaTm` arm derives
+/// the whole tile grid from, see that function's own doc -- was already
+/// fixed from `--bbox` alone before the scope was ever resolved).
+///
+/// Widens `args.bbox`/`korea_planar_bbox` in place to the envelope of
+/// `--bbox` ∪ every scope piece, when that envelope is larger. No-op unless
+/// `--input-source kr` and both `--kr-bus-stops-dir`/`--kr-bus-routes-csv`
+/// are given (the same gate `kr_transit::build_m2` itself uses) -- without
+/// those there is no route/stop data to resolve a `RouteStrip` piece from,
+/// so only the `Rect` piece (already exactly `--bbox`) could ever exist.
+///
+/// Must run after `korea_planar_bbox` is set above, and before anything
+/// downstream reads `args.bbox`/`korea_planar_bbox` to fetch elevation or
+/// size the tile grid (`main.rs` calls this immediately after this
+/// function). Re-runs the same route/stop matching `kr_transit::build_m2`
+/// will do again, properly, inside `generate_world_with_options` -- wasted
+/// work (a few seconds on real data) accepted here rather than threading
+/// this call's `StopsDocument`/reports forward through a second, wider
+/// change to that pipeline's own call graph.
+pub fn expand_bbox_for_kr_scope(args: &mut Args) {
+    if args.input_source != InputSource::Kr {
+        return;
+    }
+    let (Some(bus_stops_dir), Some(bus_routes_csv)) = (&args.kr_bus_stops_dir, &args.kr_bus_routes_csv) else {
+        return;
+    };
+    let Some(planar) = args.korea_planar_bbox else {
+        return; // validate_args reports the missing --bbox/--bbox-en properly, right after this runs
+    };
+    let pieces = crate::kr_scope::presets::yeongdo();
+    let (_doc, _reports, scope) =
+        match crate::kr_transit::build_stops_document(bus_stops_dir, bus_routes_csv, &planar, args.scale, &pieces) {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not pre-resolve KR scope for --bbox expansion ({e}) -- using \
+                     --bbox as given. If this is a real data problem, generation will fail properly \
+                     with the same error shortly."
+                );
+                return;
+            }
+        };
+
+    let (scope_e_min, scope_n_min, scope_e_max, scope_n_max) = scope.bounding_rect_en();
+    let e_min = planar.e_min().min(scope_e_min);
+    let n_min = planar.n_min().min(scope_n_min);
+    let e_max = planar.e_max().max(scope_e_max);
+    let n_max = planar.n_max().max(scope_n_max);
+    if e_min == planar.e_min() && n_min == planar.n_min() && e_max == planar.e_max() && n_max == planar.n_max() {
+        return; // no piece reaches outside --bbox; nothing to expand
+    }
+    let Ok(expanded_planar) = crate::projection::KoreaPlanarBBox::new(e_min, n_min, e_max, n_max) else {
+        return;
+    };
+
+    // `args.bbox` (lat/lon) only feeds elevation/Overture/Overpass fetch
+    // extent for `--input-source kr` -- the `KoreaTm` tile grid itself comes
+    // from `korea_planar_bbox` alone (`build_transformer`'s own doc), so
+    // this round trip through lat/lon only needs to *cover* the same real
+    // area, not reproduce it exactly (TM shear means it may end up very
+    // slightly larger, never smaller -- `from_llbbox`'s own corner-envelope
+    // approach has the same property in the other direction).
+    let mut lat_min = f64::INFINITY;
+    let mut lat_max = f64::NEG_INFINITY;
+    let mut lon_min = f64::INFINITY;
+    let mut lon_max = f64::NEG_INFINITY;
+    for &(e, n) in &[(e_min, n_min), (e_min, n_max), (e_max, n_min), (e_max, n_max)] {
+        let (lat, lon) = crate::projection::korea_tm::KoreaTmProjection::unproject_raw(e, n);
+        lat_min = lat_min.min(lat);
+        lat_max = lat_max.max(lat);
+        lon_min = lon_min.min(lon);
+        lon_max = lon_max.max(lon);
+    }
+    let Ok(expanded_llbbox) = LLBBox::new(lat_min, lon_min, lat_max, lon_max) else {
+        return;
+    };
+
+    println!(
+        "KR scope: --bbox expanded from {:.0}m x {:.0}m to {:.0}m x {:.0}m to cover this run's \
+         scope pieces (a route_strip or other piece reaches outside the given --bbox; \
+         SPEC_Scope.md §0/§2 -- the physical generation area is the scope union, not --bbox alone).",
+        planar.width_m(),
+        planar.height_m(),
+        expanded_planar.width_m(),
+        expanded_planar.height_m()
+    );
+    args.bbox = Some(expanded_llbbox);
+    args.korea_planar_bbox = Some(expanded_planar);
+}
+
 /// Clap's `--world-time` default, so `apply_body_defaults` can tell left-alone
 /// from explicitly-set.
 pub const DEFAULT_WORLD_TIME: i64 = 6_000;
