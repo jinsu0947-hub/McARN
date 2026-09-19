@@ -673,25 +673,33 @@ pub fn apply_body_defaults(args: &mut Args) {
 /// for Moon/Mars. Shared by the CLI and the GUI for the same reason that one
 /// is.
 ///
-/// This is *not* about M1-M5 (road/building/street-furniture ingestion) --
-/// those are implemented and run regardless of `args.mode` (`kr_roads`,
-/// `kr_buildings`, `kr_street_furniture` read straight off `--kr-*-dir`/
-/// `-shp`/`-csv`, never off `GenerationMode`; see `data_processing.rs`).
-/// `GenerationMode` only controls two things (`GenerationMode::terrain`/
-/// `skip_objects`): real elevation vs. flat ground, and whether *OSM/Overture*
-/// objects are fetched. `--input-source kr` never reads OSM/Overture (no
-/// `--file`, no Overpass query, no Overture footprints -- its own shapefiles
-/// are the only object source), so forcing `TerrainOnly` here just skips a
-/// fetch this input source was never going to use; it does not disable any
-/// KR-specific pipeline stage.
-pub fn apply_input_source_defaults(args: &mut Args) {
+/// The terrain-only forcing is *not* about M1-M5 (road/building/street-
+/// furniture ingestion) -- those are implemented and run regardless of
+/// `args.mode` (`kr_roads`/`kr_buildings`/`kr_street_furniture` read straight
+/// off `--kr-*-dir`/`-shp`/`-csv`, never off `GenerationMode`; see
+/// `data_processing.rs`). `GenerationMode` only controls two things
+/// (`GenerationMode::terrain`/`skip_objects`): real elevation vs. flat
+/// ground, and whether *OSM/Overture* objects are fetched. `--input-source
+/// kr` never reads OSM/Overture (no `--file`, no Overpass query, no Overture
+/// footprints -- its own shapefiles are the only object source), so forcing
+/// `TerrainOnly` here just skips a fetch this input source was never going
+/// to use; it does not disable any KR-specific pipeline stage.
+///
+/// `scale_explicit`: whether the user actually typed `--scale` (as opposed
+/// to clap filling in its own generic default, 1.0 -- see the call site in
+/// `main.rs` for why that distinction needs `ArgMatches`, not just
+/// `args.scale`'s value). `SPEC_Ingest.md §2.2` made `SCALE` a real run
+/// parameter for `--input-source kr` with a *different* default (1.75) than
+/// the rest of Arnis (1.0) -- so unlike the body-scale forcing above
+/// (genuinely fixed, always overwritten), this only fills in 1.75 when the
+/// user left `--scale` unset, and otherwise leaves their explicit value
+/// alone (`PROGRESS.md §7` item 4's "실행 파라미터로 바꾼다. 기본값은 1.75
+/// 유지").
+pub fn apply_input_source_defaults(args: &mut Args, scale_explicit: bool) {
     if args.input_source != InputSource::Kr {
         return;
     }
-    // SPEC_Ingest.md §2 fixes this as a pipeline constant ("축척 등방 1.75"),
-    // not a per-run tunable -- the same reasoning `apply_body_defaults`
-    // already applies to Moon/Mars's fixed scale.
-    if args.scale != 1.75 {
+    if !scale_explicit {
         args.scale = 1.75;
     }
     if args.projection != crate::projection::ProjectionKind::KoreaTm {

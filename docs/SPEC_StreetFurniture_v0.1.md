@@ -74,7 +74,17 @@
 
 ### 3.1 승차대 (B·C·D 등급)
 
-폭 7블록 × 깊이 3블록 × 높이 5블록.
+`round(실제_m × SCALE)` (`SPEC_RoadSection §1`과 동일). 이 항목만 다른 표들과
+달리 처음부터 "실제" 값 없이 블록 수만 적혀 있었다 — 아래는 그 블록 수를
+`SCALE=1.75`에서 그대로 재현하도록 이번에 역산해 붙인 값이다(코드 쪽 disclosed
+assumption, `kr_street_furniture::shelter_half_length`/`shelter_depth`/
+`shelter_height`).
+
+| 항목 | 실제 | `SCALE=1.75` 예시 |
+|---|---|---|
+| 폭 | 4.0 m | 7 (2×3+1) |
+| 깊이 | 1.7 m (`SPEC_BuildingType §10.3`의 "소단 폭"과 같은 값) | 3 |
+| 높이 | 2.9 m | 5 |
 
 | 부위 | 블록 |
 |---|---|

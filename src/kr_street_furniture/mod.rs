@@ -28,14 +28,22 @@ use std::collections::HashSet;
 /// debugging ("pole", "stop", ...), not read by placement logic itself.
 pub type ClaimedColumns = FnvHashMap<(i32, i32), &'static str>;
 
-/// SPEC_StreetFurniture.md §2.1.
-const POLE_SPACING: i32 = 60;
-const POLE_HEIGHT: i32 = 18;
-/// Blocks below the pole's own top, one per cross-arm tier ("2~3단").
+/// SPEC_StreetFurniture.md §2.1: `round(실제_m × SCALE)`, real values 34m
+/// (간격, 대표값) and 약 10.3m (높이, 대표값).
+fn pole_spacing(scale: f64) -> i32 {
+    kr_roads::scale_round(34.0, scale)
+}
+fn pole_height(scale: f64) -> i32 {
+    kr_roads::scale_round(10.3, scale)
+}
+/// Blocks below the pole's own top, one per cross-arm tier ("2~3단") --
+/// not in §2.1's own `round(실제_m × SCALE)` table (no real value given for
+/// where the cross-arms sit on the pole), stays fixed.
 const CROSS_ARM_TIERS: [i32; 2] = [1, 4];
-/// "전주 3개마다 1개".
+/// "전주 3개마다 1개" -- a count, not a distance, so `SCALE` doesn't apply.
 const TRANSFORMER_EVERY: u32 = 3;
-/// §2.3.
+/// §2.3: not in §2.1's table either (인입선 반경 has no stated real value) --
+/// stays fixed, same reasoning as `CROSS_ARM_TIERS`.
 const SERVICE_DROP_RADIUS: i32 = 12;
 
 struct PlacedPole {
@@ -63,7 +71,8 @@ pub fn place_utility_lines<'a>(
 ) {
     let service_drop_index = index_service_drop_buildings(buildings);
     for seg in segments {
-        let Some((left_off, right_off)) = kr_roads::furniture_column(seg.class()) else {
+        let scale = seg.scale();
+        let Some((left_off, right_off)) = kr_roads::furniture_column(seg.class(), scale) else {
             continue;
         };
         let points = seg.points();
@@ -76,6 +85,8 @@ pub fn place_utility_lines<'a>(
         // point can't both land on the same side by construction alone.
         let (sx, sz) = points[0].xz();
         let offset = if kr_roads::coord_hash(sx, sz) % 2 == 0 { left_off } else { right_off };
+        let pole_spacing = pole_spacing(scale);
+        let pole_height = pole_height(scale);
 
         let mut poles: Vec<PlacedPole> = Vec::new();
         let mut since_last = 0.0_f64; // distance walked since the last pole, carried across point pairs
@@ -90,13 +101,13 @@ pub fn place_utility_lines<'a>(
             let perp = (-dir.1, dir.0);
 
             let mut walked = 0.0_f64; // distance walked within this point pair
-            while since_last + (seg_len - walked) >= POLE_SPACING as f64 {
-                walked += POLE_SPACING as f64 - since_last;
+            while since_last + (seg_len - walked) >= pole_spacing as f64 {
+                walked += pole_spacing as f64 - since_last;
                 since_last = 0.0;
                 let t = walked / seg_len;
                 let px = x0 + ((x1 - x0) as f64 * t).round() as i32 + (perp.0 * offset as f64).round() as i32;
                 let pz = z0 + ((z1 - z0) as f64 * t).round() as i32 + (perp.1 * offset as f64).round() as i32;
-                if let Some(pole) = try_place_pole(editor, px, pz, poles.len() as u32, claimed) {
+                if let Some(pole) = try_place_pole(editor, px, pz, poles.len() as u32, claimed, pole_height) {
                     poles.push(pole);
                 }
             }
@@ -123,18 +134,18 @@ pub fn place_utility_lines<'a>(
 /// §8 already gave that column to something else. On success, places the
 /// pole shaft, its cross-arms, and (every `TRANSFORMER_EVERY`th pole) its
 /// transformer, and returns the placed pole's tier heights for wiring.
-fn try_place_pole(editor: &mut WorldEditor, x: i32, z: i32, index: u32, claimed: &mut ClaimedColumns) -> Option<PlacedPole> {
+fn try_place_pole(editor: &mut WorldEditor, x: i32, z: i32, index: u32, claimed: &mut ClaimedColumns, pole_height: i32) -> Option<PlacedPole> {
     if claimed.contains_key(&(x, z)) {
         return None;
     }
     claimed.insert((x, z), "pole");
 
     let base = editor.get_ground_level(x, z);
-    for dy in 1..=POLE_HEIGHT {
+    for dy in 1..=pole_height {
         editor.set_block_absolute(LIGHT_GRAY_CONCRETE, x, base + dy, z, None, Some(&[]));
     }
 
-    let top = base + POLE_HEIGHT;
+    let top = base + pole_height;
     let mut tier_y = [0; 2];
     for (i, &below_top) in CROSS_ARM_TIERS.iter().enumerate() {
         let y = top - below_top;
@@ -246,9 +257,24 @@ fn nearest_service_drop_building<'a>(
 // SPEC_StreetFurniture.md §3 -- 버스정류장
 // ---------------------------------------------------------------------
 
-const SHELTER_HALF_LENGTH: i32 = 3; // "폭 7블록", 3 either side of the stop's own point
-const SHELTER_DEPTH: i32 = 3; // "깊이 3블록", into the sidewalk from the curb
-const SHELTER_HEIGHT: i32 = 5;
+/// SPEC_StreetFurniture.md §3.1's shelter footprint -- unlike every other
+/// spec table, §3.1 gives block dimensions directly with no "실제" column,
+/// so these real values are this module's own disclosed choice, picked to
+/// reproduce the existing 7(=2×3+1)×3×5 footprint exactly at the default
+/// `SCALE=1.75`: width 4.0m, depth 1.7m (matches `SPEC_BuildingType §10.3`'s
+/// own "소단 폭" reference), height 2.9m.
+fn shelter_half_length(scale: f64) -> i32 {
+    kr_roads::scale_round(4.0, scale).div_euclid(2)
+}
+fn shelter_depth(scale: f64) -> i32 {
+    kr_roads::scale_round(1.7, scale)
+}
+fn shelter_height(scale: f64) -> i32 {
+    kr_roads::scale_round(2.9, scale)
+}
+/// §3.2's freestanding sign post -- not named in the SCALE-parameterization
+/// task this session did (only "정류장 승차대 치수", the shelter, was), and
+/// §3.2 gives no real value to derive one from either. Stays fixed.
 const SIGN_HEIGHT: i32 = 5;
 /// A stop more than this far from the nearest road point is almost
 /// certainly a data mismatch (wrong route, or a stop this run's bbox clips
@@ -265,6 +291,7 @@ struct RoadRef {
     x: i32,
     z: i32,
     class: RoadClass,
+    scale: f64,
     dir: (f64, f64),
 }
 
@@ -302,7 +329,7 @@ pub fn place_bus_stops<'a>(
         if (r.x - sx).pow(2) + (r.z - sz).pow(2) > MAX_STOP_TO_ROAD_DIST * MAX_STOP_TO_ROAD_DIST {
             continue;
         }
-        let Some((left_off, right_off)) = kr_roads::furniture_column(r.class) else { continue };
+        let Some((left_off, right_off)) = kr_roads::furniture_column(r.class, r.scale) else { continue };
         let perp = (-r.dir.1, r.dir.0);
         let side_point = |offset: i32| {
             (r.x + (perp.0 * offset as f64).round() as i32, r.z + (perp.1 * offset as f64).round() as i32)
@@ -316,7 +343,7 @@ pub fn place_bus_stops<'a>(
         let into_sidewalk = (perp.0 * side_sign, perp.1 * side_sign); // toward the anchor's own side, deeper into the sidewalk
 
         let spec_allows_shelter = matches!(r.class, RoadClass::B | RoadClass::C | RoadClass::D);
-        let sidewalk_wide_enough = kr_roads::sidewalk_width(r.class) >= 3;
+        let sidewalk_wide_enough = kr_roads::sidewalk_width(r.class, r.scale) >= 3;
         let has_shelter = spec_allows_shelter && sidewalk_wide_enough;
 
         let cell = |along: i32, depth: i32| {
@@ -327,8 +354,8 @@ pub fn place_bus_stops<'a>(
         };
 
         if has_shelter {
-            place_shelter(editor, cell, claimed);
-            place_sign(editor, cell(SHELTER_HALF_LENGTH, 0), claimed);
+            place_shelter(editor, cell, claimed, r.scale);
+            place_sign(editor, cell(shelter_half_length(r.scale), 0), claimed);
         } else {
             place_sign(editor, (anchor_x, anchor_z), claimed);
         }
@@ -351,13 +378,13 @@ fn collect_road_refs<'a>(segments: impl IntoIterator<Item = &'a Segment>) -> Vec
             if len < 1e-6 {
                 continue;
             }
-            refs.push(RoadRef { x: x0, z: z0, class: seg.class(), dir: ((x1 - x0) as f64 / len, (z1 - z0) as f64 / len) });
+            refs.push(RoadRef { x: x0, z: z0, class: seg.class(), scale: seg.scale(), dir: ((x1 - x0) as f64 / len, (z1 - z0) as f64 / len) });
         }
         if let (Some(last), Some(prev)) = (points.last(), points.get(points.len().wrapping_sub(2))) {
             let (x0, z0) = prev.xz();
             let (x1, z1) = last.xz();
             let len = (((x1 - x0).pow(2) + (z1 - z0).pow(2)) as f64).sqrt().max(1e-6);
-            refs.push(RoadRef { x: x1, z: z1, class: seg.class(), dir: ((x1 - x0) as f64 / len, (z1 - z0) as f64 / len) });
+            refs.push(RoadRef { x: x1, z: z1, class: seg.class(), scale: seg.scale(), dir: ((x1 - x0) as f64 / len, (z1 - z0) as f64 / len) });
         }
     }
     refs
@@ -367,26 +394,29 @@ fn nearest_road_ref<'a>(x: i32, z: i32, refs: &'a [RoadRef]) -> Option<&'a RoadR
     refs.iter().min_by_key(|r| (r.x - x).pow(2) + (r.z - z).pow(2))
 }
 
-fn place_shelter(editor: &mut WorldEditor, cell: impl Fn(i32, i32) -> (i32, i32), claimed: &mut ClaimedColumns) {
+fn place_shelter(editor: &mut WorldEditor, cell: impl Fn(i32, i32) -> (i32, i32), claimed: &mut ClaimedColumns, scale: f64) {
+    let half_length = shelter_half_length(scale);
+    let depth = shelter_depth(scale);
+    let height = shelter_height(scale);
     let (bx, bz) = cell(0, 0);
     let base = editor.get_ground_level(bx, bz);
-    let is_corner = |a: i32, d: i32| (a == -SHELTER_HALF_LENGTH || a == SHELTER_HALF_LENGTH) && (d == 0 || d == SHELTER_DEPTH - 1);
-    let is_end = |a: i32| a == -SHELTER_HALF_LENGTH || a == SHELTER_HALF_LENGTH;
-    let is_back = |d: i32| d == SHELTER_DEPTH - 1;
-    for a in -SHELTER_HALF_LENGTH..=SHELTER_HALF_LENGTH {
-        for d in 0..SHELTER_DEPTH {
+    let is_corner = |a: i32, d: i32| (a == -half_length || a == half_length) && (d == 0 || d == depth - 1);
+    let is_end = |a: i32| a == -half_length || a == half_length;
+    let is_back = |d: i32| d == depth - 1;
+    for a in -half_length..=half_length {
+        for d in 0..depth {
             let (x, z) = cell(a, d);
             claimed.entry((x, z)).or_insert("stop");
             if is_corner(a, d) {
-                for dy in 1..=SHELTER_HEIGHT {
+                for dy in 1..=height {
                     editor.set_block_absolute(LIGHT_GRAY_CONCRETE, x, base + dy, z, None, Some(&[]));
                 }
             } else if is_end(a) || is_back(d) {
-                for dy in 1..SHELTER_HEIGHT {
+                for dy in 1..height {
                     editor.set_block_absolute(GLASS_PANE, x, base + dy, z, None, Some(&[]));
                 }
             }
-            editor.set_block_absolute(SMOOTH_STONE_SLAB, x, base + SHELTER_HEIGHT, z, None, Some(&[]));
+            editor.set_block_absolute(SMOOTH_STONE_SLAB, x, base + height, z, None, Some(&[]));
             if is_back(d) && !is_end(a) {
                 editor.set_block_absolute(SMOOTH_STONE_SLAB, x, base + 1, z, None, Some(&[]));
             }
@@ -411,13 +441,14 @@ fn place_sign(editor: &mut WorldEditor, (x, z): (i32, i32), claimed: &mut Claime
 /// unlike the shelter/sign, this doesn't need the stop's real offset from
 /// it, just which side.
 fn place_stop_line(editor: &mut WorldEditor, r: &RoadRef, side_sign: f64) {
-    let Some((left_off, right_off)) = kr_roads::carriage_edge_column(r.class) else { return };
+    let Some((left_off, right_off)) = kr_roads::carriage_edge_column(r.class, r.scale) else { return };
     let offset = if side_sign < 0.0 { left_off } else { right_off };
     let perp = (-r.dir.1, r.dir.0);
     let ex = r.x + (perp.0 * offset as f64).round() as i32;
     let ez = r.z + (perp.1 * offset as f64).round() as i32;
     let base = editor.get_ground_level(ex, ez);
-    for a in -SHELTER_HALF_LENGTH..=SHELTER_HALF_LENGTH {
+    let half_length = shelter_half_length(r.scale);
+    for a in -half_length..=half_length {
         let x = ex + (r.dir.0 * a as f64).round() as i32;
         let z = ez + (r.dir.1 * a as f64).round() as i32;
         editor.set_block_absolute(YELLOW_CONCRETE, x, base, z, None, Some(&[]));
@@ -428,13 +459,26 @@ fn place_stop_line(editor: &mut WorldEditor, r: &RoadRef, side_sign: f64) {
 // SPEC_RoadSection.md §3 -- 횡단보도·정지선
 // ---------------------------------------------------------------------
 
-/// "횡단보도 길이 6블록" (§3, ×1.75 표).
-const CROSSWALK_LENGTH: i32 = 6;
+/// SPEC_RoadSection.md §3: `round(실제_m × SCALE)`, real value 3.5m
+/// (this module's representative pick within the spec's own "3~4m" range).
+fn crosswalk_length(scale: f64) -> i32 {
+    kr_roads::scale_round(3.5, scale)
+}
 /// Distance back from the intersection node the crosswalk's near edge
 /// sits, clear of SPEC_RoadSection.md §4's own curb radius (8-20 blocks) --
 /// a fixed, conservative setback rather than reading that radius back out
-/// of the (not-yet-modelled here) intersection geometry.
+/// of the (not-yet-modelled here) intersection geometry. Not one of §3's own
+/// measurements, so not scaled.
 const CROSSWALK_SETBACK: i32 = 10;
+/// SPEC_RoadSection.md §3: "정지선 0.3~0.45m 기본 규칙, 최소 1" --
+/// representative 0.375m (this table's own midpoint).
+fn stop_line_width(scale: f64) -> i32 {
+    kr_roads::scale_round(0.375, scale).max(1)
+}
+/// SPEC_RoadSection.md §3: "횡단보도 줄무늬 0.45m 교대, 최소 1".
+fn crosswalk_stripe_width(scale: f64) -> i32 {
+    kr_roads::scale_round(0.45, scale).max(1)
+}
 
 /// Places a crosswalk + stop line on every C-grade-or-above segment's
 /// approach to a real intersection (a node 3+ segment-ends touch -- a
@@ -458,10 +502,10 @@ pub fn place_crosswalks<'a>(editor: &mut WorldEditor, segments: impl IntoIterato
         }
         let (f, t) = kr_roads::endpoints(seg);
         if node_degree.get(f).copied().unwrap_or(0) >= 3 {
-            place_one_crosswalk(editor, seg.class(), points, false);
+            place_one_crosswalk(editor, seg.class(), seg.scale(), points, false);
         }
         if node_degree.get(t).copied().unwrap_or(0) >= 3 {
-            place_one_crosswalk(editor, seg.class(), points, true);
+            place_one_crosswalk(editor, seg.class(), seg.scale(), points, true);
         }
     }
 }
@@ -469,16 +513,17 @@ pub fn place_crosswalks<'a>(editor: &mut WorldEditor, segments: impl IntoIterato
 /// `from_end`: approach the intersection from the segment's *last* point
 /// backward, instead of its first point forward -- the same points list
 /// either way, just walked from the other side.
-fn place_one_crosswalk(editor: &mut WorldEditor, class: RoadClass, points: &[kr_roads::ProfilePoint], from_end: bool) {
+fn place_one_crosswalk(editor: &mut WorldEditor, class: RoadClass, scale: f64, points: &[kr_roads::ProfilePoint], from_end: bool) {
     let n = points.len();
+    let crosswalk_length = crosswalk_length(scale);
     // Walk inward from the intersection end by CROSSWALK_SETBACK blocks
-    // (points run roughly 1 block apart), then need CROSSWALK_LENGTH more
+    // (points run roughly 1 block apart), then need `crosswalk_length` more
     // beyond that for the stripes themselves.
     let idx_at = |steps_in: usize| -> usize {
         if from_end { n - 1 - steps_in.min(n - 1) } else { steps_in.min(n - 1) }
     };
     let near_idx = idx_at(CROSSWALK_SETBACK as usize);
-    let far_idx = idx_at((CROSSWALK_SETBACK + CROSSWALK_LENGTH) as usize);
+    let far_idx = idx_at((CROSSWALK_SETBACK + crosswalk_length) as usize);
     if near_idx == far_idx {
         return; // segment too short for both a setback and a crosswalk
     }
@@ -492,24 +537,31 @@ fn place_one_crosswalk(editor: &mut WorldEditor, class: RoadClass, points: &[kr_
     }
     let dir = (dx / len, dz / len);
     let perp = (-dir.1, dir.0);
-    let half_w = kr_roads::carriageway_half_width(class);
+    let half_w = kr_roads::carriageway_half_width(class, scale);
     let base = editor.get_ground_level(nx, nz);
 
-    // Stop line: one solid row, right at the crosswalk's near edge (the
-    // side closer to the intersection the vehicle is stopping for).
-    for w in -half_w..=half_w {
-        let x = nx + (perp.0 * w as f64).round() as i32;
-        let z = nz + (perp.1 * w as f64).round() as i32;
-        editor.set_block_absolute(WHITE_CONCRETE, x, base, z, None, Some(&[]));
+    // Stop line: `stop_line_width` solid rows, extending *back* toward the
+    // intersection (away from the crosswalk) from the near edge -- widening
+    // it with SCALE never eats into where the stripes start.
+    let stop_width = stop_line_width(scale);
+    for depth in 0..stop_width {
+        let lx = nx - (dir.0 * depth as f64).round() as i32;
+        let lz = nz - (dir.1 * depth as f64).round() as i32;
+        for w in -half_w..=half_w {
+            let x = lx + (perp.0 * w as f64).round() as i32;
+            let z = lz + (perp.1 * w as f64).round() as i32;
+            editor.set_block_absolute(WHITE_CONCRETE, x, base, z, None, Some(&[]));
+        }
     }
 
-    // Crosswalk: alternating 1-block stripes across CROSSWALK_LENGTH,
-    // starting one block past the stop line so the two don't merge into
-    // one wide band.
-    for step in 1..=CROSSWALK_LENGTH {
+    // Crosswalk: alternating `stripe_width`-block bands across
+    // `crosswalk_length`, starting one block past the stop line so the two
+    // don't merge into one wide band.
+    let stripe_width = crosswalk_stripe_width(scale);
+    for step in 1..=crosswalk_length {
         let cx = nx + (dir.0 * step as f64).round() as i32;
         let cz = nz + (dir.1 * step as f64).round() as i32;
-        let stripe = step % 2 == 1;
+        let stripe = ((step - 1) / stripe_width) % 2 == 0;
         for w in -half_w..=half_w {
             let x = cx + (perp.0 * w as f64).round() as i32;
             let z = cz + (perp.1 * w as f64).round() as i32;

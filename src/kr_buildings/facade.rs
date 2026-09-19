@@ -73,7 +73,7 @@ pub(super) fn build(editor: &mut WorldEditor, b: &PlannedBuilding) {
         return;
     }
     let pal = palette(b.group, b.era);
-    let (first_h, typical_h) = super::floor_heights(b.group);
+    let (first_h, typical_h) = super::floor_heights(b.group, b.scale);
     let base_band = if pal.base.is_some() { 1 } else { 0 };
     // One deterministic phase per building (SPEC_BuildingType.md §7): every
     // wall on this building starts its window rhythm at the same offset, so

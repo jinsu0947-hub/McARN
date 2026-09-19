@@ -4,7 +4,9 @@
 //! 정류장명)만 쓴다 -- 나머지는 시간대별 승하차 통계로, 이 프로젝트가 읽을
 //! 일이 없다.
 //!
-//! **기준일 2023-07-31** -- 파일명이 그대로 밝히는 값이다. SPEC_GenerationScope.md
+//! **기준일** -- 파일명(`..._YYYYMMDD.csv`)이 그대로 밝히는 값이다
+//! (`reference_date_from_filename`, CSV 내용엔 별도 기준일 필드가 없다).
+//! 지금 쓰는 파일 기준으로는 2023-07-31. SPEC_GenerationScope.md
 //! §1.2("노선 데이터는 단일 기준일의 스냅샷으로 고정한다")에 따라 이 날짜를
 //! `manifest.json`에 그대로 기록한다. 부산 시내버스 2025-07-05 전면개편
 //! **이전** 자료라서, 개편 이후 신설·변경된 노선/정류소는 여기 없다 -- 지시에
@@ -33,10 +35,32 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-/// SPEC_GenerationScope.md §1.2's 기준일 -- this CSV's own filename date,
-/// recorded verbatim rather than read from the file (the file has no
-/// explicit as-of field of its own).
-pub const REFERENCE_DATE: &str = "2023-07-31";
+/// SPEC_GenerationScope.md §1.2's 기준일, when the CSV's own filename
+/// doesn't parse as `..._YYYYMMDD.csv` (`reference_date_from_filename`'s own
+/// fallback) -- this project's long-used file, kept as a last resort so a
+/// missing/renamed date never fails the whole run over one manifest field.
+const FALLBACK_REFERENCE_DATE: &str = "2023-07-31";
+
+/// SPEC_GenerationScope.md §1.2's 기준일 -- read from the CSV's own filename
+/// (PROGRESS.md §7 item 6: this used to be `REFERENCE_DATE`, a hardcoded
+/// constant, so swapping in a different CSV -- a newer snapshot, or another
+/// city's -- still stamped the old file's date into `manifest.json`). The
+/// CSV itself carries no as-of field, only its name does, so this is read
+/// from the path, not the file's contents.
+pub fn reference_date_from_filename(csv_path: &Path) -> String {
+    let stem = csv_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let last8: Vec<char> = stem.chars().rev().take(8).collect();
+    if last8.len() == 8 && last8.iter().all(char::is_ascii_digit) {
+        let digits: String = last8.into_iter().rev().collect();
+        return format!("{}-{}-{}", &digits[0..4], &digits[4..6], &digits[6..8]);
+    }
+    eprintln!(
+        "Warning: bus route CSV filename {:?} doesn't end in an 8-digit date (YYYYMMDD) -- \
+         using the fallback reference date {FALLBACK_REFERENCE_DATE} in manifest.json.",
+        csv_path.file_name().unwrap_or_default()
+    );
+    FALLBACK_REFERENCE_DATE.to_string()
+}
 
 /// One CSV row's first four columns -- everything downstream (route
 /// polyline construction) needs, once `stop_code` can be resolved to a
@@ -53,7 +77,7 @@ pub struct RouteStop {
 /// is what lets a route-network shortest-path fallback reconstruct the
 /// polyline when link IDs aren't available -- they aren't, here).
 pub struct RouteData {
-    pub reference_date: &'static str,
+    pub reference_date: String,
     pub stops_by_route: HashMap<String, Vec<RouteStop>>,
 }
 
@@ -103,7 +127,7 @@ pub fn load_route_stops(csv_path: &Path) -> Result<RouteData, String> {
         stops.sort_by_key(|s| s.seq);
     }
 
-    Ok(RouteData { reference_date: REFERENCE_DATE, stops_by_route })
+    Ok(RouteData { reference_date: reference_date_from_filename(csv_path), stops_by_route })
 }
 
 #[cfg(test)]

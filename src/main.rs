@@ -183,10 +183,21 @@ fn run_cli() {
     // Fire-and-forget update check; prints a one-line notice on a background thread.
     version_check::check_for_updates_async();
 
-    // Parse input arguments
-    let mut args: Args = Args::parse();
+    // Parse input arguments. Uses `get_matches`/`from_arg_matches` instead of
+    // the simpler `Args::parse()` only so `apply_input_source_defaults` (see
+    // its own doc) can tell "the user didn't pass --scale" apart from "the
+    // user explicitly passed --scale 1.0" -- both parse to the same `f64`,
+    // and clap's derive API has no other way to ask "was this arg's value
+    // its own default" without the underlying `ArgMatches`. Same error/help
+    // behaviour as `Args::parse()`: `get_matches()` already prints and exits
+    // on a parse error or `--help`/`--version`.
+    let matches = <Args as clap::CommandFactory>::command().get_matches();
+    let scale_explicit =
+        matches.value_source("scale") != Some(clap::parser::ValueSource::DefaultValue);
+    let mut args: Args = <Args as clap::FromArgMatches>::from_arg_matches(&matches)
+        .unwrap_or_else(|e| e.exit());
     args::apply_body_defaults(&mut args);
-    args::apply_input_source_defaults(&mut args);
+    args::apply_input_source_defaults(&mut args, scale_explicit);
     let args = args;
 
     // Validate arguments (path requirements differ between Java and Bedrock)
@@ -677,8 +688,11 @@ fn run_cli() {
                     let dir_label = dir.file_name().and_then(|n| n.to_str());
                     sources.push(manifest::road_network_source_entry(dir_label));
                 }
-                if args.kr_bus_stops_dir.is_some() && args.kr_bus_routes_csv.is_some() {
-                    sources.push(manifest::bus_route_source_entry(crate::kr_bus_routes::REFERENCE_DATE));
+                if args.kr_bus_stops_dir.is_some() {
+                    if let Some(csv_path) = &args.kr_bus_routes_csv {
+                        let reference_date = crate::kr_bus_routes::reference_date_from_filename(csv_path);
+                        sources.push(manifest::bus_route_source_entry(&reference_date));
+                    }
                 }
                 sources
             },

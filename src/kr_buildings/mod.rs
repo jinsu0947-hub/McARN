@@ -177,21 +177,27 @@ fn classify_use_group(main_use: &str, floors_above: u32) -> UseGroup {
     UseGroup::X
 }
 
-/// SPEC_BuildingType.md §2's own table, in blocks.
-fn floor_heights(group: UseGroup) -> (i32, i32) {
+/// SPEC_BuildingType.md §2's own table: `round(실제_m × SCALE)`, the same
+/// rule `SPEC_RoadSection §1` uses. Real heights: 주거(R/A) 3.4m both
+/// floors; 상가·업무(C/O/X) 4.6m 1층/3.4m 기준층; 산업(I) 6.9m (단층 기준).
+fn floor_heights(group: UseGroup, scale: f64) -> (i32, i32) {
+    let residential = kr_roads::scale_round(3.4, scale);
+    let commercial_first = kr_roads::scale_round(4.6, scale);
+    let industrial = kr_roads::scale_round(6.9, scale);
     match group {
-        UseGroup::R | UseGroup::A => (6, 6),
-        UseGroup::C | UseGroup::O | UseGroup::X => (8, 6),
+        UseGroup::R | UseGroup::A => (residential, residential),
+        UseGroup::C | UseGroup::O | UseGroup::X => (commercial_first, residential),
         // "12 (단층 기준)": the spec gives no 기준층 value for I because it
         // expects industrial buildings to mostly be single-storey; the rare
-        // multi-floor 공장/창고 record in this data just repeats the same 12
-        // per floor rather than switching to an undocumented second number.
-        UseGroup::I => (12, 12),
+        // multi-floor 공장/창고 record in this data just repeats the same
+        // scaled 6.9m per floor rather than switching to an undocumented
+        // second number.
+        UseGroup::I => (industrial, industrial),
     }
 }
 
-fn total_height_blocks(group: UseGroup, floors_above: u32) -> i32 {
-    let (first, typical) = floor_heights(group);
+fn total_height_blocks(group: UseGroup, floors_above: u32, scale: f64) -> i32 {
+    let (first, typical) = floor_heights(group, scale);
     let floors = floors_above.max(1);
     first + (floors as i32 - 1) * typical
 }
@@ -342,6 +348,12 @@ pub struct PlannedBuilding {
     /// (compute time, never evicted -- see `kr_roads`' module doc for why
     /// that matters) for `slope`'s cut/fill decision at placement time.
     terrain_y: HashMap<(i32, i32), i32>,
+    /// This run's `SCALE` (`SPEC_Ingest.md §2.2`) -- `facade::build` and
+    /// `slope::grade_site` need it (floor heights, retaining-tier cap) but
+    /// only ever see a `&PlannedBuilding`, not `compute_kr_buildings`'s own
+    /// `scale` parameter, so it's carried here the same way `kr_roads::Segment`
+    /// carries it for its own per-segment placement functions.
+    scale: f64,
 }
 
 impl PlannedBuilding {
@@ -420,9 +432,9 @@ fn rasterize(footprint_block: &[(f64, f64)]) -> Vec<(i32, i32)> {
 /// that segment's centerline. `candidates` is pre-filtered to segments whose
 /// `aabb()` reaches this building (see `compute_kr_buildings`), so this is a
 /// small inner loop, not a scan of the whole road network per building.
-fn is_road_occupied(cell_center: (f64, f64), candidates: &[(&[crate::kr_roads::ProfilePoint], RoadClass)]) -> bool {
+fn is_road_occupied(cell_center: (f64, f64), candidates: &[(&[crate::kr_roads::ProfilePoint], RoadClass)], scale: f64) -> bool {
     for (points, class) in candidates {
-        let half_width = (kr_roads::road_total_width(*class) as f64) / 2.0;
+        let half_width = (kr_roads::road_total_width(*class, scale) as f64) / 2.0;
         let xz: Vec<(i32, i32)> = points.iter().map(|p| p.xz()).collect();
         if geom::point_polyline_distance(cell_center, &xz) <= half_width {
             return true;
@@ -509,7 +521,7 @@ pub fn compute_kr_buildings(
         let remaining_cells: Vec<(i32, i32)> = original_cells
             .iter()
             .copied()
-            .filter(|&(x, z)| !is_road_occupied((x as f64 + 0.5, z as f64 + 0.5), &candidates))
+            .filter(|&(x, z)| !is_road_occupied((x as f64 + 0.5, z as f64 + 0.5), &candidates, scale))
             .collect();
         let ratio = remaining_cells.len() as f64 / original_cells.len() as f64;
 
@@ -531,7 +543,7 @@ pub fn compute_kr_buildings(
 
         let group = classify_use_group(&rec.main_use, rec.floors_above);
         let era = Era::from_year(rec.approval_year);
-        let total_height = total_height_blocks(group, rec.floors_above);
+        let total_height = total_height_blocks(group, rec.floors_above, scale);
 
         // SPEC_BuildingType.md §10.1: front floor = nearest road point's
         // already-solved height. Candidates use the *unpadded* aabb match
@@ -559,7 +571,7 @@ pub fn compute_kr_buildings(
             let ground_y = ground.level(XZPoint::new(cx - xzbbox.min_x(), cz - xzbbox.min_z()));
             planned.push(finish_building(
                 rec, cells_for_output, ground_y, total_height, group, era, omitted, clipped, None, None, ground,
-                xzbbox, &mut delta_samples,
+                xzbbox, &mut delta_samples, scale,
             ));
             continue;
         };
@@ -599,12 +611,13 @@ pub fn compute_kr_buildings(
             ground,
             xzbbox,
             &mut delta_samples,
+            scale,
         );
         b.detail_level = detail_level;
         planned.push(b);
     }
 
-    report_slope_resolution(&delta_samples);
+    report_slope_resolution(&delta_samples, scale);
 
     let report = KrBuildingsReport {
         loaded: raw.len(),
@@ -632,6 +645,7 @@ fn finish_building(
     ground: &Ground,
     xzbbox: &XZBBox,
     delta_samples: &mut Vec<i32>,
+    scale: f64,
 ) -> PlannedBuilding {
     let mut terrain_y = HashMap::with_capacity(cells.len());
     let mut min_h = i32::MAX;
@@ -659,6 +673,7 @@ fn finish_building(
         front_segment,
         front_point,
         terrain_y,
+        scale,
     }
 }
 
@@ -667,23 +682,31 @@ fn finish_building(
 /// spread (Δ, in blocks) across every classified building, so whether the
 /// 30 m source DEM actually degrades SPEC_BuildingType.md §10's grading can
 /// be read off real numbers.
-fn report_slope_resolution(deltas: &[i32]) {
+fn report_slope_resolution(deltas: &[i32], scale: f64) {
     if deltas.is_empty() {
         return;
     }
+    // SPEC_BuildingType.md §10.2: flat cutoff is `round(1.1m × SCALE)`; the
+    // 축대-vs-단나눔 split is "기준층 1개 층고" -- reuses R's own typical
+    // floor height (§2), matching `slope::grade_threshold`/`max_single_tier_blocks`
+    // exactly so this report's buckets never drift from what
+    // `slope::grade_site` actually does.
+    let flat_max = kr_roads::scale_round(1.1, scale);
+    let tier_split = floor_heights(UseGroup::R, scale).1;
     let mut sorted = deltas.to_vec();
     sorted.sort_unstable();
     let n = sorted.len();
     let pct = |p: f64| sorted[((p * (n - 1) as f64).round() as usize).min(n - 1)];
-    let flat = sorted.iter().filter(|&&d| d <= 2).count();
-    let retain = sorted.iter().filter(|&&d| d >= 3 && d <= 6).count();
-    let tiered = sorted.iter().filter(|&&d| d >= 7).count();
+    let flat = sorted.iter().filter(|&&d| d <= flat_max).count();
+    let retain = sorted.iter().filter(|&&d| d > flat_max && d <= tier_split).count();
+    let tiered = sorted.iter().filter(|&&d| d > tier_split).count();
     println!(
         "KR buildings: footprint Δ (elevation spread, blocks) over {n} buildings -- \
-         median={} p90={} max={}; §10.2 buckets: flat(≤2)={flat} retain(3-6)={retain} tiered(≥7)={tiered}",
+         median={} p90={} max={}; §10.2 buckets: flat(≤{flat_max})={flat} retain({}-{tier_split})={retain} tiered(>{tier_split})={tiered}",
         pct(0.5),
         pct(0.9),
-        sorted[n - 1]
+        sorted[n - 1],
+        flat_max + 1,
     );
 }
 
@@ -787,10 +810,10 @@ mod tests {
 
     #[test]
     fn total_height_matches_worked_example() {
-        // R, 4 floors: 6 (1st) + 3*6 (typical) = 24
-        assert_eq!(total_height_blocks(UseGroup::R, 4), 24);
+        // Default SCALE=1.75. R, 4 floors: 6 (1st) + 3*6 (typical) = 24
+        assert_eq!(total_height_blocks(UseGroup::R, 4, 1.75), 24);
         // C, 1 floor: just the 1st-floor height
-        assert_eq!(total_height_blocks(UseGroup::C, 1), 8);
+        assert_eq!(total_height_blocks(UseGroup::C, 1, 1.75), 8);
     }
 
     #[test]

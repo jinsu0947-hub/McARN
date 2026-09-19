@@ -88,8 +88,42 @@ use shapefile::DbfTable;
 
 /// SPEC_RoadProfile.md §1.2 / §4: 45 degrees, expressed as max |Δy2| per block.
 const MAX_SLOPE_Y2: i32 = 2;
-/// SPEC_RoadSection.md §1: y2 = 1 (half a block).
-const CURB_HEIGHT_Y2: i32 = 1;
+
+/// SPEC_RoadSection.md §1's shared "블록값 = `round(실제_m × SCALE)`" rule --
+/// used by every KR spec (RoadSection/StreetFurniture/BuildingType/Bridge)
+/// that scales a real-world measurement into blocks, not just this module's
+/// own road cross-sections. `SCALE` defaults to 1.75 (`SPEC_Ingest.md §2.2`)
+/// but is a run parameter (`Args::scale`); this function has no default of
+/// its own on purpose -- every caller already has a `scale: f64` in scope.
+pub fn scale_round(real_m: f64, scale: f64) -> i32 {
+    (real_m * scale).round() as i32
+}
+
+/// Same rule in half-block (`y2`) units -- `SPEC_RoadSection.md §1`'s curb-
+/// height row (`y2 = round(실제_m × SCALE × 2)`) and anything else that needs
+/// finer-than-a-block resolution.
+pub fn scale_round_y2(real_m: f64, scale: f64) -> i32 {
+    (real_m * scale * 2.0).round() as i32
+}
+
+/// SPEC_RoadSection.md §1's "인도를 짝수로 올리는 것은 의도적이다" rounding
+/// correction -- rounds an odd block count up by one so a sidewalk always
+/// splits evenly into a curb-side furniture column and a walkable remainder.
+pub fn round_up_to_even(n: i32) -> i32 {
+    if n % 2 != 0 {
+        n + 1
+    } else {
+        n
+    }
+}
+
+/// SPEC_RoadSection.md §1: real height 0.25 m, `y2 = max(1, round(실제_m ×
+/// SCALE × 2))` -- a curb is never omitted regardless of scale (`SPEC_RoadSection
+/// §7`'s own "생략 없음 -- 축척과 무관하게 항상 그린다"), so this is a `max`,
+/// not a floor-then-omit like the sidewalk/F-grade thresholds.
+fn curb_height_y2(scale: f64) -> i32 {
+    scale_round_y2(0.25, scale).max(1)
+}
 /// Iteration counts for the two Gauss-Seidel-style relaxations (§4's
 /// `MAX_ITER`=10 is for the *constraint* repair loop specifically; the
 /// smoothing relaxations themselves need many more sweeps to converge on a
@@ -191,20 +225,67 @@ impl SectionSpec {
     }
 }
 
-fn section_spec(class: RoadClass) -> SectionSpec {
+/// SPEC_RoadSection.md §1 real-world references behind each `SectionSpec`
+/// component. Named here (not inlined into `section_spec`) so the "새 숫자를
+/// 만들지 않았다" claim in §2's own text is checkable against one place.
+const LANE_MAIN_M: f64 = 3.5; // §1 "차로 (주간선)"
+const LANE_MINOR_M: f64 = 3.0; // §1 "차로 (보조·이면)"
+const SIDEWALK_STD_M: f64 = 2.0; // §1 "인도 (표준)"
+const SHOULDER_M: f64 = 2.5; // §1 "갓길" -- expressway-only per its own remark
+const MEDIAN_PHYSICAL_M: f64 = 2.0; // §1 "중앙분리대"
+const MEDIAN_PAINT_BLOCKS: i32 = 1; // §1 "중앙선 (도색)": fixed, scale-independent
+/// F "이면·골목"'s single paved strip has no named row in §1 (its own "차로폭"
+/// column is "--"): §2's own text claims every number reuses a §1 unit, but
+/// this one genuinely doesn't map to any of them. Disclosed, not guessed
+/// silently -- chosen to reproduce the existing 8-block total exactly at
+/// `SCALE=1.75` (4.5 × 1.75 = 7.875 -> round 8), split evenly into the two
+/// `carriage_each` halves `total_width()` expects.
+const F_TOTAL_M: f64 = 4.5;
+
+/// SPEC_RoadSection.md §7 "축척 생략 규칙": below the stated minimum, the
+/// element is omitted outright (0), never substituted with something else
+/// (no widening the carriage to fill a dropped sidewalk or median, etc.).
+/// §7's own minimum for 인도/갓길/중앙분리대 is all 1 block.
+fn round_or_omit(raw: i32) -> i32 {
+    if raw < 1 {
+        0
+    } else {
+        raw
+    }
+}
+
+fn section_spec(class: RoadClass, scale: f64) -> SectionSpec {
+    let sidewalk = round_or_omit(round_up_to_even(scale_round(SIDEWALK_STD_M, scale)));
+    let shoulder = round_or_omit(scale_round(SHOULDER_M, scale));
+    let lane_main = scale_round(LANE_MAIN_M, scale);
+    let lane_minor = scale_round(LANE_MINOR_M, scale);
+    // §7: "중앙분리대·도색 1블록 미달 시 생략" -- only the A/B physical
+    // divider can fall this way (C/D's median is `MEDIAN_PAINT_BLOCKS`, a
+    // fixed 1, never scaled below it).
+    let median_physical = round_or_omit(scale_round(MEDIAN_PHYSICAL_M, scale));
+    // §7: "F등급 총 폭 4블록(차량 1대 통행) 미달 시 도로 자체를 이 명세의
+    // 대상에서 제외." A zero-width `SectionSpec` (every band empty,
+    // `cross_section_layout` produces no columns) is this module's read of
+    // "제외" -- no pavement gets swept, no ground override gets registered,
+    // so the link is left exactly as raw terrain, matching §7's own
+    // "지형으로 메우거나 보행로 전용으로 별도 처리" -- actually excluding the
+    // link from the network graph is a bigger, upstream change this session
+    // doesn't make.
+    let f_total = scale_round(F_TOTAL_M, scale);
+    let f_carriage = if f_total < 4 { 0 } else { f_total.div_euclid(2) };
     match class {
-        // 총 50: 갓길4 + 연석1 + 차도18 + 분리대4 + 차도18 + 연석1 + 갓길4
-        RoadClass::A => SectionSpec { outer_each: 4, curb_each: 1, carriage_each: 18, median_total: 4, outer_is_shoulder: true },
-        // 총 50: 인도4 + 연석1 + 차도18 + 분리대4 + 차도18 + 연석1 + 인도4
-        RoadClass::B => SectionSpec { outer_each: 4, curb_each: 1, carriage_each: 18, median_total: 4, outer_is_shoulder: false },
-        // 총 31: 인도4 + 연석1 + 차도10 + 중앙선1 + 차도10 + 연석1 + 인도4
-        RoadClass::C => SectionSpec { outer_each: 4, curb_each: 1, carriage_each: 10, median_total: 1, outer_is_shoulder: false },
-        // 총 21: 인도4 + 연석1 + 차도5 + 중앙선1 + 차도5 + 연석1 + 인도4
-        RoadClass::D => SectionSpec { outer_each: 4, curb_each: 1, carriage_each: 5, median_total: 1, outer_is_shoulder: false },
-        // 총 20: 인도4 + 연석1 + 차도5 + 차도5 + 연석1 + 인도4 (중앙 없음)
-        RoadClass::E => SectionSpec { outer_each: 4, curb_each: 1, carriage_each: 5, median_total: 0, outer_is_shoulder: false },
-        // 총 8: 단일 포장면, 인도/연석/중앙 없음
-        RoadClass::F => SectionSpec { outer_each: 0, curb_each: 0, carriage_each: 4, median_total: 0, outer_is_shoulder: false },
+        // 갓길{shoulder} + 연석1 + 차도(주간선×3){lane_main×3} + 분리대{median_physical} + 차도×3 + 연석1 + 갓길
+        RoadClass::A => SectionSpec { outer_each: shoulder, curb_each: 1, carriage_each: lane_main * 3, median_total: median_physical, outer_is_shoulder: true },
+        // 인도{sidewalk} + 연석1 + 차도(주간선×3) + 분리대{median_physical} + 차도×3 + 연석1 + 인도
+        RoadClass::B => SectionSpec { outer_each: sidewalk, curb_each: 1, carriage_each: lane_main * 3, median_total: median_physical, outer_is_shoulder: false },
+        // 인도 + 연석1 + 차도(보조·이면×2){lane_minor×2} + 중앙선(고정1) + 차도×2 + 연석1 + 인도
+        RoadClass::C => SectionSpec { outer_each: sidewalk, curb_each: 1, carriage_each: lane_minor * 2, median_total: MEDIAN_PAINT_BLOCKS, outer_is_shoulder: false },
+        // 인도 + 연석1 + 차도(보조·이면×1) + 중앙선(고정1) + 차도×1 + 연석1 + 인도
+        RoadClass::D => SectionSpec { outer_each: sidewalk, curb_each: 1, carriage_each: lane_minor, median_total: MEDIAN_PAINT_BLOCKS, outer_is_shoulder: false },
+        // 인도 + 연석1 + 차도(보조·이면×1) + 차도×1 + 연석1 + 인도 (중앙 없음)
+        RoadClass::E => SectionSpec { outer_each: sidewalk, curb_each: 1, carriage_each: lane_minor, median_total: 0, outer_is_shoulder: false },
+        // 단일 포장면{F_TOTAL_M}, 인도/연석/중앙 없음
+        RoadClass::F => SectionSpec { outer_each: 0, curb_each: 0, carriage_each: f_carriage, median_total: 0, outer_is_shoulder: false },
     }
 }
 
@@ -278,21 +359,22 @@ impl ProfilePoint {
 /// `kr_buildings`' road-occupancy clip (SPEC_Ingest.md §4.2 step 2): the same
 /// per-grade total paved width `sweep_and_place` already sweeps, exposed for
 /// a caller outside this module.
-pub(crate) fn road_total_width(class: RoadClass) -> i32 {
-    section_spec(class).total_width()
+pub(crate) fn road_total_width(class: RoadClass, scale: f64) -> i32 {
+    section_spec(class, scale).total_width()
 }
 
 /// SPEC_StreetFurniture.md §3.1's "인도 폭이 3블록 미만이면 승차대를
 /// 생략한다" check -- one side's sidewalk width, in blocks.
-pub(crate) fn sidewalk_width(class: RoadClass) -> i32 {
-    section_spec(class).outer_each
+pub(crate) fn sidewalk_width(class: RoadClass, scale: f64) -> i32 {
+    section_spec(class, scale).outer_each
 }
 
 /// SPEC_RoadSection.md §3's crosswalk/stop-line width: half the paved
 /// (non-sidewalk) cross-section, so a caller sweeping `-w..=w` from the
 /// centerline covers curb-to-curb without spilling onto the sidewalk.
-pub(crate) fn carriageway_half_width(class: RoadClass) -> i32 {
-    section_spec(class).total_width() / 2 - section_spec(class).outer_each
+pub(crate) fn carriageway_half_width(class: RoadClass, scale: f64) -> i32 {
+    let spec = section_spec(class, scale);
+    spec.total_width() / 2 - spec.outer_each
 }
 
 /// `kr_street_furniture`'s intersection-marking pass (SPEC_RoadSection.md
@@ -316,11 +398,11 @@ pub(crate) fn endpoints(seg: &Segment) -> (&str, &str) {
 /// curb note, but E's *sidewalk* one-column rule reads as the far edge, not
 /// the curb side, so it's picked out separately here rather than reusing
 /// the curb-adjacent search below).
-pub(crate) fn furniture_column(class: RoadClass) -> Option<(i32, i32)> {
+pub(crate) fn furniture_column(class: RoadClass, scale: f64) -> Option<(i32, i32)> {
     if matches!(class, RoadClass::A | RoadClass::F) {
         return None;
     }
-    let spec = section_spec(class);
+    let spec = section_spec(class, scale);
     let layout = cross_section_layout(&spec);
     if class == RoadClass::E {
         let left = layout.first()?.0;
@@ -357,8 +439,8 @@ pub(crate) fn furniture_column(class: RoadClass) -> Option<(i32, i32)> {
 /// `section_spec` having no callers that reach it without a driving surface
 /// anyway; F has no curb at all, `curb_each` 0, so no Curb cell ever exists
 /// to search from).
-pub(crate) fn carriage_edge_column(class: RoadClass) -> Option<(i32, i32)> {
-    let spec = section_spec(class);
+pub(crate) fn carriage_edge_column(class: RoadClass, scale: f64) -> Option<(i32, i32)> {
+    let spec = section_spec(class, scale);
     let layout = cross_section_layout(&spec);
     let mut left = None;
     let mut right = None;
@@ -386,6 +468,14 @@ pub struct Segment {
     f_node: String,
     t_node: String,
     points: Vec<ProfilePoint>,
+    /// This run's `SCALE` (`SPEC_Ingest.md §2.2`), carried per-segment so
+    /// every cross-section function that already has a `Segment` in hand
+    /// (`aabb`, `sweep_and_place`, `register_ground_overrides`, `place_segments`,
+    /// ...) can read it without a second parameter threaded through every
+    /// call site -- it's a whole-run constant, not really per-segment, but
+    /// storing it here is far less invasive than adding `scale: f64` to
+    /// every function that iterates `&[Segment]`.
+    scale: f64,
     /// SPEC_Bridge.md: confirmed, not estimated -- true only for the
     /// hand-built deck segments `bridges::MANUAL_BRIDGES` adds. Every
     /// 표준노드링크-derived segment is `false`, including any that
@@ -408,6 +498,9 @@ impl Segment {
     pub(crate) fn class(&self) -> RoadClass {
         self.class
     }
+    pub(crate) fn scale(&self) -> f64 {
+        self.scale
+    }
     pub(crate) fn points(&self) -> &[ProfilePoint] {
         &self.points
     }
@@ -418,7 +511,7 @@ impl Segment {
     /// to cover every block `place_segments` sweeps for it, without needing
     /// to know the tile grid's halo constant here.
     pub fn aabb(&self) -> (i32, i32, i32, i32) {
-        let pad = section_spec(self.class).total_width();
+        let pad = section_spec(self.class, self.scale).total_width();
         let mut min_x = i32::MAX;
         let mut max_x = i32::MIN;
         let mut min_z = i32::MAX;
@@ -820,12 +913,13 @@ fn cross_section_layout(spec: &SectionSpec) -> Vec<(i32, Band)> {
 /// writing roadway/curb/sidewalk blocks at `y2`. `dir` is the (unit-ish)
 /// forward direction, used only to build the perpendicular.
 #[allow(clippy::too_many_arguments)]
-fn sweep_and_place(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: RoadClass, dir: (f64, f64)) {
+fn sweep_and_place(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: RoadClass, scale: f64, dir: (f64, f64)) {
     use crate::block_definitions::*;
 
     let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(1e-6);
     let perp = (-dir.1 / len, dir.0 / len);
-    let spec = section_spec(class);
+    let spec = section_spec(class, scale);
+    let curb_y2 = curb_height_y2(scale);
 
     let y_full = y2.div_euclid(2);
     let has_slab = y2.rem_euclid(2) == 1;
@@ -859,7 +953,7 @@ fn sweep_and_place(editor: &mut WorldEditor, x: i32, z: i32, y2: i32, class: Roa
                 // 도색 (median/lane paint, crosswalk stripes) gives the
                 // preview a real way to tell roads from buildings.
                 let block = if coord_hash(px, pz) % 2 == 0 { LIGHT_GRAY_CONCRETE } else { POLISHED_ANDESITE };
-                let sidewalk_y2 = y2 + CURB_HEIGHT_Y2;
+                let sidewalk_y2 = y2 + curb_y2;
                 place_full(editor, block, px, pz, sidewalk_y2.div_euclid(2));
                 if sidewalk_y2.rem_euclid(2) == 1 {
                     place_full(editor, SMOOTH_STONE_SLAB, px, pz, sidewalk_y2.div_euclid(2) + 1);
@@ -1076,6 +1170,7 @@ pub fn compute_kr_road_network(
             f_node: l.f_node.clone(),
             t_node: l.t_node.clone(),
             points,
+            scale,
             is_bridge: false,
         });
     }
@@ -1142,6 +1237,7 @@ pub fn compute_kr_road_network(
             f_node: bridge.end_node_ids[0].map(str::to_string).unwrap_or_else(|| format!("bridge{bi:02}-a")),
             t_node: bridge.end_node_ids[1].map(str::to_string).unwrap_or_else(|| format!("bridge{bi:02}-b")),
             points,
+            scale,
             is_bridge: true,
         });
     }
@@ -1212,7 +1308,7 @@ pub fn register_ground_overrides<'a>(editor: &mut WorldEditor, segments: impl In
     for seg in segments {
         for w in seg.points.windows(2) {
             let dir = ((w[1].x - w[0].x) as f64, (w[1].z - w[0].z) as f64);
-            let (left, right) = register_cross_section_ys(editor, w[0].x, w[0].z, w[0].y2, seg.class, dir);
+            let (left, right) = register_cross_section_ys(editor, w[0].x, w[0].z, w[0].y2, seg.class, seg.scale, dir);
             register_taper(editor, left, edge_perp(dir, true));
             register_taper(editor, right, edge_perp(dir, false));
         }
@@ -1223,7 +1319,7 @@ pub fn register_ground_overrides<'a>(editor: &mut WorldEditor, segments: impl In
             } else {
                 (1.0, 0.0)
             };
-            let (left, right) = register_cross_section_ys(editor, last.x, last.z, last.y2, seg.class, dir);
+            let (left, right) = register_cross_section_ys(editor, last.x, last.z, last.y2, seg.class, seg.scale, dir);
             register_taper(editor, left, edge_perp(dir, true));
             register_taper(editor, right, edge_perp(dir, false));
         }
@@ -1261,7 +1357,7 @@ pub fn mark_paved_footprint<'a>(bitmap: &mut CoordinateBitmap, segments: impl In
     for seg in segments {
         for w in seg.points.windows(2) {
             let dir = ((w[1].x - w[0].x) as f64, (w[1].z - w[0].z) as f64);
-            mark_cross_section(bitmap, w[0].x, w[0].z, seg.class, dir);
+            mark_cross_section(bitmap, w[0].x, w[0].z, seg.class, seg.scale, dir);
         }
         if let Some(last) = seg.points.last() {
             let dir = if seg.points.len() >= 2 {
@@ -1270,17 +1366,17 @@ pub fn mark_paved_footprint<'a>(bitmap: &mut CoordinateBitmap, segments: impl In
             } else {
                 (1.0, 0.0)
             };
-            mark_cross_section(bitmap, last.x, last.z, seg.class, dir);
+            mark_cross_section(bitmap, last.x, last.z, seg.class, seg.scale, dir);
         }
     }
 }
 
 /// One point's cross-section cells, marked into `bitmap` -- the plan-only
 /// (no `WorldEditor`, no surface-Y) counterpart of `register_cross_section_ys`.
-fn mark_cross_section(bitmap: &mut CoordinateBitmap, x: i32, z: i32, class: RoadClass, dir: (f64, f64)) {
+fn mark_cross_section(bitmap: &mut CoordinateBitmap, x: i32, z: i32, class: RoadClass, scale: f64, dir: (f64, f64)) {
     let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(1e-6);
     let perp = (-dir.1 / len, dir.0 / len);
-    let spec = section_spec(class);
+    let spec = section_spec(class, scale);
     for (offset, _band) in cross_section_layout(&spec) {
         let px = x + (perp.0 * offset as f64).round() as i32;
         let pz = z + (perp.1 * offset as f64).round() as i32;
@@ -1322,11 +1418,13 @@ fn register_cross_section_ys(
     z: i32,
     y2: i32,
     class: RoadClass,
+    scale: f64,
     dir: (f64, f64),
 ) -> ((i32, i32, i32), (i32, i32, i32)) {
     let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(1e-6);
     let perp = (-dir.1 / len, dir.0 / len);
-    let spec = section_spec(class);
+    let spec = section_spec(class, scale);
+    let curb_y2 = curb_height_y2(scale);
     let y_full = y2.div_euclid(2);
     let has_slab = y2.rem_euclid(2) == 1;
     let mut left_edge = None;
@@ -1336,7 +1434,7 @@ fn register_cross_section_ys(
         let pz = z + (perp.1 * offset as f64).round() as i32;
         let surface_y = match band {
             Band::Sidewalk => {
-                let sidewalk_y2 = y2 + CURB_HEIGHT_Y2;
+                let sidewalk_y2 = y2 + curb_y2;
                 sidewalk_y2.div_euclid(2) + i32::from(sidewalk_y2.rem_euclid(2) == 1)
             }
             _ => y_full + i32::from(has_slab),
@@ -1402,7 +1500,7 @@ pub fn place_retaining_walls<'a>(editor: &mut WorldEditor, segments: impl IntoIt
     for seg in segments {
         for w in seg.points.windows(2) {
             let dir = ((w[1].x - w[0].x) as f64, (w[1].z - w[0].z) as f64);
-            let (left, right) = cross_section_edges(w[0].x, w[0].z, w[0].y2, seg.class, dir);
+            let (left, right) = cross_section_edges(w[0].x, w[0].z, w[0].y2, seg.class, seg.scale, dir);
             place_wall_if_needed(editor, left, edge_perp(dir, true));
             place_wall_if_needed(editor, right, edge_perp(dir, false));
         }
@@ -1413,7 +1511,7 @@ pub fn place_retaining_walls<'a>(editor: &mut WorldEditor, segments: impl IntoIt
             } else {
                 (1.0, 0.0)
             };
-            let (left, right) = cross_section_edges(last.x, last.z, last.y2, seg.class, dir);
+            let (left, right) = cross_section_edges(last.x, last.z, last.y2, seg.class, seg.scale, dir);
             place_wall_if_needed(editor, left, edge_perp(dir, true));
             place_wall_if_needed(editor, right, edge_perp(dir, false));
         }
@@ -1424,10 +1522,11 @@ pub fn place_retaining_walls<'a>(editor: &mut WorldEditor, segments: impl IntoIt
 /// `register_road_surface_y` side effect -- `place_retaining_walls` runs
 /// after ground generation, when re-registering overrides would do nothing
 /// useful (ground has already been built).
-fn cross_section_edges(x: i32, z: i32, y2: i32, class: RoadClass, dir: (f64, f64)) -> ((i32, i32, i32), (i32, i32, i32)) {
+fn cross_section_edges(x: i32, z: i32, y2: i32, class: RoadClass, scale: f64, dir: (f64, f64)) -> ((i32, i32, i32), (i32, i32, i32)) {
     let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(1e-6);
     let perp = (-dir.1 / len, dir.0 / len);
-    let spec = section_spec(class);
+    let spec = section_spec(class, scale);
+    let curb_y2 = curb_height_y2(scale);
     let y_full = y2.div_euclid(2);
     let has_slab = y2.rem_euclid(2) == 1;
     let mut left_edge = None;
@@ -1437,7 +1536,7 @@ fn cross_section_edges(x: i32, z: i32, y2: i32, class: RoadClass, dir: (f64, f64
         let pz = z + (perp.1 * offset as f64).round() as i32;
         let surface_y = match band {
             Band::Sidewalk => {
-                let sidewalk_y2 = y2 + CURB_HEIGHT_Y2;
+                let sidewalk_y2 = y2 + curb_y2;
                 sidewalk_y2.div_euclid(2) + i32::from(sidewalk_y2.rem_euclid(2) == 1)
             }
             _ => y_full + i32::from(has_slab),
@@ -1486,7 +1585,7 @@ pub fn place_segments<'a>(editor: &mut WorldEditor, segments: impl IntoIterator<
     for seg in segments {
         for w in seg.points.windows(2) {
             let dir = ((w[1].x - w[0].x) as f64, (w[1].z - w[0].z) as f64);
-            sweep_and_place(editor, w[0].x, w[0].z, w[0].y2, seg.class, dir);
+            sweep_and_place(editor, w[0].x, w[0].z, w[0].y2, seg.class, seg.scale, dir);
         }
         if let Some(last) = seg.points.last() {
             let dir = if seg.points.len() >= 2 {
@@ -1495,7 +1594,7 @@ pub fn place_segments<'a>(editor: &mut WorldEditor, segments: impl IntoIterator<
             } else {
                 (1.0, 0.0)
             };
-            sweep_and_place(editor, last.x, last.z, last.y2, seg.class, dir);
+            sweep_and_place(editor, last.x, last.z, last.y2, seg.class, seg.scale, dir);
         }
     }
 }
@@ -1586,7 +1685,7 @@ pub fn write_roadgraph_json(
     let graph_segments: Vec<GraphSegment> = segments
         .iter()
         .map(|s| {
-            let spec = section_spec(s.class);
+            let spec = section_spec(s.class, s.scale);
             GraphSegment {
                 id: s.id.clone(),
                 link_id: s.link_id.clone(),
@@ -1735,7 +1834,11 @@ mod tests {
 
     #[test]
     fn section_spec_totals_match_spec_road_section_table() {
-        // SPEC_RoadSection.md §2's own **총 폭** column (2026-09-13 재계산).
+        // SPEC_RoadSection.md §2's own **총 폭** column at the default
+        // SCALE=1.75 (2026-09-13 재계산) -- the "산출 예시" numbers, not a
+        // scale-independent structural claim (§2 says the numbers move with
+        // SCALE; only the *construction* -- lane counts, band choice -- stays
+        // fixed, see `section_spec_scales_with_a_different_scale` below).
         let expected = [
             (RoadClass::A, 50),
             (RoadClass::B, 50),
@@ -1745,7 +1848,7 @@ mod tests {
             (RoadClass::F, 8),
         ];
         for (class, total) in expected {
-            let spec = section_spec(class);
+            let spec = section_spec(class, 1.75);
             assert_eq!(spec.total_width(), total, "{:?} total width", class);
             let layout = cross_section_layout(&spec);
             assert_eq!(layout.len() as i32, total, "{:?} layout column count", class);
@@ -1753,16 +1856,32 @@ mod tests {
     }
 
     #[test]
+    fn section_spec_scales_with_a_different_scale() {
+        // SPEC_RoadSection.md §1's formula applied at SCALE=1.0 (no rounding
+        // wiggle at whole-metre lane/sidewalk widths, so exact expected
+        // values are easy to hand-compute): lane 3.5m->4 (round, not floor)
+        // wait -- round(3.5)=4 by "round half away from zero", ×3 lanes = 12;
+        // sidewalk 2.0m->2 (already even); curb 1 (fixed); median 2.0m->2.
+        // B total = 2*(2+1+12)+2 = 32.
+        let b = section_spec(RoadClass::B, 1.0);
+        assert_eq!(b.outer_each, 2);
+        assert_eq!(b.curb_each, 1);
+        assert_eq!(b.carriage_each, 12);
+        assert_eq!(b.median_total, 2);
+        assert_eq!(b.total_width(), 32);
+    }
+
+    #[test]
     fn cross_section_layout_places_an_explicit_curb_column_where_the_table_says_so() {
         // A/E previously had no curb column at all; §2's own worked examples
         // put one between every carriageway and its outer band except F.
         for class in [RoadClass::A, RoadClass::B, RoadClass::C, RoadClass::D, RoadClass::E] {
-            let spec = section_spec(class);
+            let spec = section_spec(class, 1.75);
             let layout = cross_section_layout(&spec);
             let curb_columns = layout.iter().filter(|(_, b)| *b == Band::Curb).count();
             assert_eq!(curb_columns, 2, "{:?} must have exactly one curb column on each side", class);
         }
-        let f_layout = cross_section_layout(&section_spec(RoadClass::F));
+        let f_layout = cross_section_layout(&section_spec(RoadClass::F, 1.75));
         assert!(f_layout.iter().all(|(_, b)| *b != Band::Curb), "F has no curb");
     }
 
