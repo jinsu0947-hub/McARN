@@ -667,12 +667,23 @@ pub fn apply_body_defaults(args: &mut Args) {
     }
 }
 
-/// SPEC_Ingest.md §2/§5, SPEC_Build.md M0: `--input-source kr` selects the
-/// Korea Central Belt (EPSG:5186) coordinate transform and, since the Korean
-/// road/building ingestion it implies isn't built yet (M1/M4), forces
-/// terrain-only generation -- the same "source picks mode" precedent
-/// `apply_body_defaults` already sets for Moon/Mars. Shared by the CLI and the
-/// GUI for the same reason that one is.
+/// SPEC_Ingest.md §2/§5: `--input-source kr` selects the Korea Central Belt
+/// (EPSG:5186) coordinate transform and forces terrain-only generation --
+/// the same "source picks mode" precedent `apply_body_defaults` already sets
+/// for Moon/Mars. Shared by the CLI and the GUI for the same reason that one
+/// is.
+///
+/// This is *not* about M1-M5 (road/building/street-furniture ingestion) --
+/// those are implemented and run regardless of `args.mode` (`kr_roads`,
+/// `kr_buildings`, `kr_street_furniture` read straight off `--kr-*-dir`/
+/// `-shp`/`-csv`, never off `GenerationMode`; see `data_processing.rs`).
+/// `GenerationMode` only controls two things (`GenerationMode::terrain`/
+/// `skip_objects`): real elevation vs. flat ground, and whether *OSM/Overture*
+/// objects are fetched. `--input-source kr` never reads OSM/Overture (no
+/// `--file`, no Overpass query, no Overture footprints -- its own shapefiles
+/// are the only object source), so forcing `TerrainOnly` here just skips a
+/// fetch this input source was never going to use; it does not disable any
+/// KR-specific pipeline stage.
 pub fn apply_input_source_defaults(args: &mut Args) {
     if args.input_source != InputSource::Kr {
         return;
@@ -688,8 +699,11 @@ pub fn apply_input_source_defaults(args: &mut Args) {
     }
     if args.mode != GenerationMode::TerrainOnly {
         eprintln!(
-            "Note: --input-source kr only has terrain implemented so far (SPEC_Build.md M0); \
-             forcing --mode terrain-only. Road and building ingestion are M1/M4."
+            "Note: --input-source kr forces --mode terrain-only -- this input source never \
+             reads OSM/Overture objects (its own --kr-* shapefiles are the only object \
+             source), so there is nothing for a non-terrain-only mode to add. Road/building/ \
+             street-furniture ingestion (kr_roads/kr_buildings/kr_street_furniture) is \
+             unaffected by this and still runs."
         );
         args.mode = GenerationMode::TerrainOnly;
     }

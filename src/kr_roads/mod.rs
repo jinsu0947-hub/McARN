@@ -76,6 +76,7 @@ pub mod routing;
 pub mod shapefile;
 
 use crate::coordinate_system::cartesian::{XZBBox, XZPoint};
+use crate::floodfill_cache::CoordinateBitmap;
 use crate::ground::Ground;
 use crate::projection::korea_tm::KoreaPlanarBBox;
 use crate::world_editor::WorldEditor;
@@ -1226,6 +1227,64 @@ pub fn register_ground_overrides<'a>(editor: &mut WorldEditor, segments: impl In
             register_taper(editor, left, edge_perp(dir, true));
             register_taper(editor, right, edge_perp(dir, false));
         }
+    }
+}
+
+/// SPEC_RoadSection.md §5.1 "노면 위 식생": marks every road/sidewalk cross-
+/// section cell (roadway, shoulder, curb, median, sidewalk -- everything
+/// `cross_section_layout` enumerates, the same "total paved width"
+/// `is_road_occupied` uses for the building cut-out) into a caller-owned
+/// exclusion bitmap, so ground generation can skip planting vegetation there
+/// *before* it ever places a tree -- the same "오려내고 세운다" principle
+/// SPEC_RoadSection.md §5 already uses for buildings, not a cleanup pass
+/// after the fact. Deliberately excludes `register_taper`'s blend zone
+/// outside the sidewalk -- that's real (if flattened) terrain, not paving,
+/// so it keeps whatever vegetation land cover would otherwise put there.
+///
+/// Must run before ground generation's own tree-placement pass sees the
+/// bitmap, same timing requirement as `register_ground_overrides` (see its
+/// own doc) and for the same reason: `kr_roads` hasn't painted its actual
+/// pavement blocks yet at that point in the pipeline (M1's block placement
+/// runs per-tile, after M0's terrain/vegetation pass), so a check against
+/// already-placed blocks would still see natural ground and let a tree
+/// through. This bitmap is the thing that lets ground generation know
+/// *before* placement, without waiting for the real blocks to land.
+///
+/// Bridge decks (`bridges::MANUAL_BRIDGES`, folded into `segments` as regular
+/// `Segment`s with `is_bridge: true`) go through the same loop as any other
+/// segment, so a deck's own footprint is excluded automatically. Tunnels
+/// have no separate code path to add here -- see this module's own doc:
+/// 표준노드링크 carries no reliable bridge/tunnel field, so every link
+/// (a real tunnel included) is already modelled as an ordinary ground-
+/// following segment and is covered by the same loop.
+pub fn mark_paved_footprint<'a>(bitmap: &mut CoordinateBitmap, segments: impl IntoIterator<Item = &'a Segment>) {
+    for seg in segments {
+        for w in seg.points.windows(2) {
+            let dir = ((w[1].x - w[0].x) as f64, (w[1].z - w[0].z) as f64);
+            mark_cross_section(bitmap, w[0].x, w[0].z, seg.class, dir);
+        }
+        if let Some(last) = seg.points.last() {
+            let dir = if seg.points.len() >= 2 {
+                let p = &seg.points[seg.points.len() - 2];
+                ((last.x - p.x) as f64, (last.z - p.z) as f64)
+            } else {
+                (1.0, 0.0)
+            };
+            mark_cross_section(bitmap, last.x, last.z, seg.class, dir);
+        }
+    }
+}
+
+/// One point's cross-section cells, marked into `bitmap` -- the plan-only
+/// (no `WorldEditor`, no surface-Y) counterpart of `register_cross_section_ys`.
+fn mark_cross_section(bitmap: &mut CoordinateBitmap, x: i32, z: i32, class: RoadClass, dir: (f64, f64)) {
+    let len = (dir.0 * dir.0 + dir.1 * dir.1).sqrt().max(1e-6);
+    let perp = (-dir.1 / len, dir.0 / len);
+    let spec = section_spec(class);
+    for (offset, _band) in cross_section_layout(&spec) {
+        let px = x + (perp.0 * offset as f64).round() as i32;
+        let pz = z + (perp.1 * offset as f64).round() as i32;
+        bitmap.set(px, pz);
     }
 }
 

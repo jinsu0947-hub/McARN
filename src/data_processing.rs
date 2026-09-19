@@ -992,6 +992,20 @@ pub fn generate_world_with_options(
             None
         };
 
+    // SPEC_RoadSection.md §5.1 "노면 위 식생": fold the road/sidewalk paved
+    // footprint into the same exclusion bitmap the OSM tunnel-bore pass
+    // already populates (`tunnel_footprint`, checked by ground generation's
+    // tree-placement code before it ever plants) -- both are "don't grow
+    // vegetation here" footprints read by the same call sites, and this run
+    // never has real OSM tunnel data to collide with (`--input-source kr`).
+    // Must happen before ground generation runs on any tile below, same
+    // ordering requirement as `register_ground_overrides` (kr_roads hasn't
+    // placed its own pavement blocks yet at that point -- see
+    // `kr_roads::mark_paved_footprint`'s own doc).
+    if let Some(network) = &kr_road_network {
+        crate::kr_roads::mark_paved_footprint(&mut tunnel_footprint, &network.segments);
+    }
+
     // SPEC_Build.md M4 "건물": solved once, here, after M1's road network --
     // see `kr_buildings`' module doc. Needs `--kr-buildings-shp` and
     // `--kr-roads-dir` (footprints are clipped against M1's already-solved

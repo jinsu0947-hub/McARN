@@ -141,7 +141,7 @@ pub(super) fn build(editor: &mut WorldEditor, b: &PlannedBuilding) {
             } else if is_ground_floor {
                 ground_floor_block(b.group, &pal, faces_front, signage_color, y_off, first_h, base_band)
             } else if in_window_run && !is_roofline_row {
-                glass_for(b.group)
+                glass_for(b.group, b.era)
             } else {
                 pal.wall_band.filter(|_| should_band(b.group, y_off, first_h, typical_h)).unwrap_or(pal.wall)
             };
@@ -167,10 +167,24 @@ fn should_band(group: UseGroup, y_off: i32, first_h: i32, typical_h: i32) -> boo
     matches!(group, UseGroup::O | UseGroup::A | UseGroup::I) && ((y_off - first_h) / typical_h.max(1)) % 2 == 1
 }
 
-fn glass_for(group: UseGroup) -> Block {
-    match group {
-        UseGroup::I => LIGHT_GRAY_CONCRETE, // §5.3: I gets almost no windows; treated as wall, not glass
-        _ => GLASS_PANE,
+fn glass_for(group: UseGroup, era: Era) -> Block {
+    match (group, era) {
+        (UseGroup::I, _) => LIGHT_GRAY_CONCRETE, // §5.3: I gets almost no windows; treated as wall, not glass
+        // §5.3: C-e4/O-e4's window_run material *is* their continuous
+        // horizontal band ("띠창") -- window_run is wide and wall_run is a
+        // single column, so most of the wall is this material running
+        // unbroken along the floor. A pane connects cleanly there, so it
+        // keeps `glass_pane`. (`wall_band`'s own stained-glass, used for
+        // O/A/I's separate alternating-floor stripe, is already a solid
+        // block and unaffected either way.)
+        (UseGroup::C, Era::E4) | (UseGroup::O, Era::E4) => GLASS_PANE,
+        // Every other floor-broken repeating window (R-all, A-all, C-e1~e3,
+        // O-e2/e3) uses `glass`, not `glass_pane` -- the pane's connected-
+        // texture face only reads as one sheet against a neighbouring pane,
+        // but this pattern is interrupted by a wall row every floor, so a
+        // pane here stands alone like an isolated cross-shaped post. `glass`
+        // has no connection concept, so it reads flat regardless.
+        _ => GLASS,
     }
 }
 

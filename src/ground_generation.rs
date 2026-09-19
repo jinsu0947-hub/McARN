@@ -936,8 +936,14 @@ pub fn generate_ground_region(
                                     Some(bridge_surface),
                                 );
                             }
+                            // SPEC_RoadSection.md §5.1: road/sidewalk (and bridge-deck) columns
+                            // are excluded up front, same as `tunnel_footprint`'s own bore
+                            // columns already are -- not just the tree cases below, every land-
+                            // cover vegetation/prop this match places (shrubs, grass, flowers,
+                            // crops, wetland patches) skips a column reserved for paving.
                             if has_land_cover
                                 && !sealed
+                                && !tunnel_footprint.contains(x, z)
                                 && !editor.block_exists_absolute(x, ground_y + 1, z)
                             {
                                 let cover = ground.cover_class(coord);
